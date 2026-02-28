@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__forge-brain__*",
+      "mcp__a2a__*",
+      "mcp__youtube-transcript__*",
+      "WebSearch",
+      "WebFetch",
+      "Read",
+      "Glob",
+      "Grep"
+    ],
+    "deny": [
+      "Bash",
+      "Edit",
+      "Write",
+      "MultiEdit",
+      "NotebookEdit"
+    ]
+  }
+}
