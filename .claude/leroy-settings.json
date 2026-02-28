@@ -4,11 +4,17 @@
       "mcp__forge-brain__*",
       "mcp__a2a__*",
       "mcp__youtube-transcript__*",
-      "WebSearch",
-      "WebFetch",
+      "Bash",
+      "Edit",
+      "Write",
       "Read",
       "Glob",
-      "Grep"
+      "Grep",
+      "WebSearch",
+      "WebFetch",
+      "MultiEdit",
+      "NotebookEdit",
+      "Agent"
     ]
   }
 }
