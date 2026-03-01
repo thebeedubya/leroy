@@ -260,7 +260,7 @@ async def _execute_task(task_id: str, spec: str) -> None:
 # Agent Executor
 # ---------------------------------------------------------------------------
 class LeroyExecutor(AgentExecutor):
-    """Receives specs from PM, queues them for interactive Leroy pickup."""
+    """Receives specs from PM, executes via claude -p with dashboard visibility."""
 
     async def execute(
         self,
@@ -276,7 +276,7 @@ class LeroyExecutor(AgentExecutor):
                 if hasattr(part, "root") and hasattr(part.root, "text"):
                     spec_text += part.root.text
 
-        # Store task metadata as pending -- interactive Leroy picks it up
+        # Store task metadata
         _task_meta[task_id] = {
             "task_id": task_id,
             "spec": spec_text,
@@ -286,17 +286,20 @@ class LeroyExecutor(AgentExecutor):
             "completed_at": None,
         }
 
-        logger.info("Task %s received (spec length: %d chars) -- queued for pickup", task_id, len(spec_text))
+        logger.info("Task %s received (spec length: %d chars) -- launching execution", task_id, len(spec_text))
 
-        # Trigger persistence queue flush (non-blocking)
+        # Trigger persistence queue flush on task pickup (non-blocking)
         _persist_manager.flush_if_ready()
+
+        # Fire off execution in background (don't await -- let it run)
+        asyncio.create_task(_execute_task(task_id, spec_text))
 
         _broadcast_task_update_sync(task_id)
 
-        # Respond immediately via A2A protocol -- task is queued, not executing
+        # Respond immediately via A2A protocol
         await event_queue.enqueue_event(
             new_agent_text_message(
-                f"Task {task_id} received and queued. "
+                f"Task {task_id} received and executing. "
                 f"Spec length: {len(spec_text)} chars. "
                 f"Poll GET /tasks/{task_id} for status."
             )
