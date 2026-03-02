@@ -1,6 +1,25 @@
 import { useState, useEffect, useCallback } from 'react'
 
 /**
+ * Fetch with AbortController timeout and response.ok check.
+ */
+function fetchWithTimeout(url, timeoutMs = 5000) {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  return fetch(url, { signal: controller.signal })
+    .then((r) => {
+      clearTimeout(timer)
+      if (!r.ok) throw new Error(`HTTP ${r.status}`)
+      return r.json()
+    })
+    .catch((err) => {
+      clearTimeout(timer)
+      if (err.name === 'AbortError') throw new Error('Request timed out (5s)')
+      throw err
+    })
+}
+
+/**
  * Poll /api/brain/health and /api/infra/status every 30 seconds.
  */
 export function useSystem() {
@@ -12,8 +31,8 @@ export function useSystem() {
 
   const fetchAll = useCallback(async () => {
     const [brainRes, infraRes] = await Promise.allSettled([
-      fetch('/api/brain/health').then((r) => r.json()),
-      fetch('/api/infra/status').then((r) => r.json()),
+      fetchWithTimeout('/api/brain/health', 5000),
+      fetchWithTimeout('/api/infra/status', 5000),
     ])
 
     if (brainRes.status === 'fulfilled') {

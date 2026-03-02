@@ -154,7 +154,10 @@ export function SystemTab() {
       </div>
 
       {loading && !brainHealth && !infraStatus ? (
-        <div className="font-mono text-sm text-slate-600">Checking system status...</div>
+        <div className="flex items-center gap-2 font-mono text-sm text-slate-400">
+          <span className="inline-block w-2 h-2 rounded-full bg-slate-400 animate-pulse flex-shrink-0" />
+          Checking system status...
+        </div>
       ) : (
         <div className="flex flex-col lg:flex-row gap-6">
           {/* Left: Brain Health */}

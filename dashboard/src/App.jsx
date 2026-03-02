@@ -43,6 +43,8 @@ export default function App() {
   }
 
   const qaReviewCount = tasks.filter((t) => t.status === 'qa_review').length
+  // Exclude ideas from the "active tasks" count shown in the header
+  const activeTaskCount = tasks.filter((t) => t.status !== 'idea').length
 
   // Decisions hook for badge count
   const { pending: pendingDecisions } = useDecisions()
@@ -79,6 +81,60 @@ export default function App() {
     setSelectedTaskId(taskId)
   }
 
+  // --- Idea handlers ---
+  const handleAddIdea = useCallback(async (title, description) => {
+    try {
+      const res = await fetch('/api/ideas', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title, description }),
+      })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const task = await res.json()
+      setTasks((prev) => [...prev, task])
+    } catch (err) {
+      console.error('Failed to create idea:', err)
+    }
+  }, [setTasks])
+
+  const handlePromoteIdea = useCallback(async (taskId) => {
+    try {
+      const res = await fetch(`/api/ideas/${taskId}/promote`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const data = await res.json()
+      if (data.task) {
+        setTasks((prev) => {
+          const idx = prev.findIndex((t) => t.task_id === taskId)
+          if (idx === -1) return prev
+          const next = [...prev]
+          next[idx] = data.task
+          return next
+        })
+      }
+    } catch (err) {
+      console.error('Failed to promote idea:', err)
+    }
+  }, [setTasks])
+
+  const handleDiscardIdea = useCallback(async (taskId) => {
+    try {
+      const res = await fetch(`/api/tasks/${taskId}/cancel`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      // Remove from local state immediately
+      setTasks((prev) => prev.filter((t) => t.task_id !== taskId))
+    } catch (err) {
+      console.error('Failed to discard idea:', err)
+    }
+  }, [setTasks])
+
   const tabBadges = {
     tasks: qaReviewCount > 0 ? qaReviewCount : null,
     decisions: pendingDecisionCount > 0 ? pendingDecisionCount : null,
@@ -88,7 +144,7 @@ export default function App() {
     <div className="h-screen bg-forge-bg flex flex-col overflow-hidden">
       <Header
         lastUpdated={lastUpdated}
-        taskCount={tasks.length}
+        taskCount={activeTaskCount}
         refreshCount={refreshCount}
         sseConnected={sseConnected}
         connectionType={connectionType}
@@ -123,6 +179,9 @@ export default function App() {
                     tasks={tasks}
                     selectedTaskId={selectedTaskId}
                     onSelectTask={handleSelectTask}
+                    onAddIdea={handleAddIdea}
+                    onPromoteIdea={handlePromoteIdea}
+                    onDiscardIdea={handleDiscardIdea}
                   />
                 </div>
               )}

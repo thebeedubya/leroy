@@ -2,9 +2,9 @@
 spec_id: qa-respec-workforce-hub-22-criteria-must-produce-p
 task_id: 77c0a04c-dd87-48a8-891c-5f0da4142bbe
 date: 2026-03-02
-status: sent
-pass_rate: (pending)
-retrospective: (pending)
+status: failed
+pass_rate: 0/22 (empty results -- pipe drain bug in server lost all output)
+retrospective: ## Retrospective **What worked in this spec:** The spec itself was solid. 22 criteria, clear test plan, parallel backend/frontend agents. Leroy ran for ~3 minutes and exited rc=0. **What caused friction:** The subprocess pipe reader had a bug where it exited before draining buffered output when the claude process terminated. Both this task and dd6fe7a9 hit the same root cause. The spec was fine, the infrastructure lost the results. Ops identified and fixed the drain bug (5-second drain loop at both exit paths). **Spec improvement for next time:** Nothing to change in the spec. This was an infrastructure bug, not a spec bug. The fix (pipe drain loop) is now in place. Future QA tasks should capture output reliably.
 tags: []
 ---
 
@@ -101,3 +101,13 @@ Medium. But finishing is mandatory. Do not time out before producing the table.
 
 ## Execution
 Use agent teams. One agent for backend (curl every endpoint), one for frontend (read source files and verify components). Both agents report back. You compile the table. Do not exit without it.
+---
+## Outcome
+**Task ID:** 77c0a04c-dd87-48a8-891c-5f0da4142bbe
+**QA pass rate:** 0/22 (empty results -- pipe drain bug in server lost all output)
+
+## Retrospective
+## Retrospective
+**What worked in this spec:** The spec itself was solid. 22 criteria, clear test plan, parallel backend/frontend agents. Leroy ran for ~3 minutes and exited rc=0.
+**What caused friction:** The subprocess pipe reader had a bug where it exited before draining buffered output when the claude process terminated. Both this task and dd6fe7a9 hit the same root cause. The spec was fine, the infrastructure lost the results. Ops identified and fixed the drain bug (5-second drain loop at both exit paths).
+**Spec improvement for next time:** Nothing to change in the spec. This was an infrastructure bug, not a spec bug. The fix (pipe drain loop) is now in place. Future QA tasks should capture output reliably.

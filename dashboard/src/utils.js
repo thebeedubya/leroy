@@ -87,6 +87,16 @@ export function parseSuccessCriteria(result) {
  * Status metadata for display.
  */
 export const STATUS_CONFIG = {
+  idea: {
+    label: 'IDEA',
+    columnLabel: 'IDEAS',
+    textColor: 'text-violet-400',
+    bgColor: 'bg-violet-400/10',
+    borderColor: 'border-violet-400/25',
+    dotColor: 'bg-violet-400',
+    headerColor: 'text-violet-400',
+    pulse: false,
+  },
   pending: {
     label: 'PENDING',
     columnLabel: 'PENDING',
@@ -202,7 +212,7 @@ export function relativeTime(iso) {
  * Sort tasks: working first, pending second, then by created_at descending.
  */
 export function sortTasks(tasks) {
-  const order = { working: 0, waiting_for_pm: 1, pending: 2, qa_review: 3, completed: 4, failed: 5, cancelled: 6 }
+  const order = { idea: 0, working: 1, waiting_for_pm: 2, pending: 3, qa_review: 4, completed: 5, failed: 6, cancelled: 7 }
   return [...tasks].sort((a, b) => {
     const oa = order[a.status] ?? 5
     const ob = order[b.status] ?? 5

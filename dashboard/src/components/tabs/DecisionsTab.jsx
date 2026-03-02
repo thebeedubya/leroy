@@ -1,5 +1,7 @@
 import { useState } from 'react'
 import { useDecisions } from '../../hooks/useDecisions'
+import { useProposals } from '../../hooks/useProposals'
+import { ProposalsSection } from '../ProposalsSection'
 import { relativeTime } from '../../utils'
 
 const TYPE_CONFIG = {
@@ -141,15 +143,18 @@ function DecisionItem({ msg, onRespond }) {
 
 export function DecisionsTab() {
   const { pending, loading, error, refresh, respond } = useDecisions()
+  const { pending: proposals, recent: recentProposals, approve, reject } = useProposals()
+
+  const totalPending = pending.length + proposals.length
 
   return (
     <div className="flex-1 overflow-y-auto p-6">
       <div className="flex items-center justify-between mb-4">
         <h2 className="font-mono text-sm font-semibold text-slate-300">
           Decisions
-          {pending.length > 0 && (
+          {totalPending > 0 && (
             <span className="ml-2 inline-flex items-center justify-center min-w-[18px] h-4 px-1 rounded-full bg-red-500 text-white text-[10px] font-bold">
-              {pending.length}
+              {totalPending}
             </span>
           )}
         </h2>
@@ -167,12 +172,22 @@ export function DecisionsTab() {
         </div>
       )}
 
+      {/* PM Proposals -- highest priority, shown above messages */}
+      <ProposalsSection
+        proposals={proposals}
+        recent={recentProposals}
+        onApprove={approve}
+        onReject={reject}
+      />
+
       {loading && pending.length === 0 ? (
         <div className="font-mono text-sm text-slate-600">Loading decisions...</div>
       ) : pending.length === 0 ? (
-        <div className="font-mono text-sm text-slate-600">
-          No pending decisions. Leroy is unblocked.
-        </div>
+        proposals.length === 0 ? (
+          <div className="font-mono text-sm text-slate-600">
+            No pending decisions. Leroy is unblocked.
+          </div>
+        ) : null
       ) : (
         <div className="space-y-3">
           <div className="font-mono text-xs text-slate-500 uppercase tracking-wider mb-2">

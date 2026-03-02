@@ -2,9 +2,9 @@
 spec_id: dashboard-decisions-tab-pm-proposals-approvereject
 task_id: 5b22edb8-612a-422a-be06-337b32796db7
 date: 2026-03-02
-status: sent
-pass_rate: (pending)
-retrospective: (pending)
+status: failed
+pass_rate: 13/14 (1 failure: Test 11 Dark Theme Compliance -- forge-bg class missing from PM Proposals section header row)
+retrospective: ## Retrospective **What worked in this spec:** The component architecture was clean. Separate useProposals hook, conditional rendering for empty state, collapsible spec preview, reject-requires-feedback gate, polling intervals, badge count -- all landed exactly as specced. 13 of 14 criteria passed on first QA pass. The "frontend only, no backend modifications" constraint was respected. File structure followed existing dashboard patterns.  **What caused friction:** Test 11 (Dark Theme Compliance) failed. The section header row for "PM Proposals" did not apply the forge-bg background class, breaking visual consistency with other dashboard sections. The spec listed the required classes (forge-bg, forge-card, forge-border, forge-surface) but did not explicitly map which class goes on which element. Leroy applied forge-card and forge-border correctly on cards and containers but missed the top-level section background.  **Spec improvement for next time:** When speccing dark theme compliance, do not just list the class names. Map them to structural elements: "Section wrapper uses bg-forge-bg. Cards use bg-forge-card with border-forge-border. Interactive surfaces use bg-forge-surface." Give Leroy a class-to-element mapping table, not just a list of tokens. This eliminates ambiguity about where each theme class applies.
 tags: []
 ---
 
@@ -92,3 +92,15 @@ Simple to medium. One new component section in an existing tab. No backend work.
 
 ## Execution
 Use agent teams. One agent to build the ProposalsSection component, one to wire it into the existing Decisions tab and test the polling + approve/reject flow.
+---
+## Outcome
+**Task ID:** 5b22edb8-612a-422a-be06-337b32796db7
+**QA pass rate:** 13/14 (1 failure: Test 11 Dark Theme Compliance -- forge-bg class missing from PM Proposals section header row)
+
+## Retrospective
+## Retrospective
+**What worked in this spec:** The component architecture was clean. Separate useProposals hook, conditional rendering for empty state, collapsible spec preview, reject-requires-feedback gate, polling intervals, badge count -- all landed exactly as specced. 13 of 14 criteria passed on first QA pass. The "frontend only, no backend modifications" constraint was respected. File structure followed existing dashboard patterns.
+
+**What caused friction:** Test 11 (Dark Theme Compliance) failed. The section header row for "PM Proposals" did not apply the forge-bg background class, breaking visual consistency with other dashboard sections. The spec listed the required classes (forge-bg, forge-card, forge-border, forge-surface) but did not explicitly map which class goes on which element. Leroy applied forge-card and forge-border correctly on cards and containers but missed the top-level section background.
+
+**Spec improvement for next time:** When speccing dark theme compliance, do not just list the class names. Map them to structural elements: "Section wrapper uses bg-forge-bg. Cards use bg-forge-card with border-forge-border. Interactive surfaces use bg-forge-surface." Give Leroy a class-to-element mapping table, not just a list of tokens. This eliminates ambiguity about where each theme class applies.

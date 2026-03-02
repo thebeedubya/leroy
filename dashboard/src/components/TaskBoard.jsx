@@ -1,4 +1,5 @@
 import { TaskColumn } from './TaskColumn'
+import { IdeaColumn } from './IdeaColumn'
 import { STATUS_CONFIG, sortTasks } from '../utils'
 
 const COLUMNS = [
@@ -10,8 +11,11 @@ const COLUMNS = [
   { status: 'failed', label: 'FAILED' },
 ]
 
-export function TaskBoard({ tasks, selectedTaskId, onSelectTask }) {
-  // Group tasks by status (put cancelled into failed column)
+export function TaskBoard({ tasks, selectedTaskId, onSelectTask, onAddIdea, onPromoteIdea, onDiscardIdea }) {
+  // Separate ideas from the rest
+  const ideaTasks = tasks.filter((t) => t.status === 'idea')
+
+  // Group non-idea tasks by status (put cancelled into failed column)
   const grouped = {
     pending: [],
     working: [],
@@ -22,6 +26,7 @@ export function TaskBoard({ tasks, selectedTaskId, onSelectTask }) {
   }
 
   for (const task of tasks) {
+    if (task.status === 'idea') continue  // handled by IdeaColumn
     const bucket = task.status === 'cancelled' ? 'failed' :
                    (grouped[task.status] !== undefined ? task.status : 'failed')
     grouped[bucket].push(task)
@@ -33,7 +38,16 @@ export function TaskBoard({ tasks, selectedTaskId, onSelectTask }) {
   }
 
   return (
-    <div className="grid grid-cols-6 gap-4 h-full">
+    <div className="grid grid-cols-7 gap-4 h-full">
+      {/* Ideas column -- leftmost */}
+      <IdeaColumn
+        tasks={sortTasks(ideaTasks)}
+        onAddIdea={onAddIdea}
+        onPromoteIdea={onPromoteIdea}
+        onDiscardIdea={onDiscardIdea}
+      />
+
+      {/* Standard pipeline columns */}
       {COLUMNS.map(({ status, label }) => (
         <TaskColumn
           key={status}
