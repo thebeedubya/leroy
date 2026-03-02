@@ -95,9 +95,32 @@ When engineering work is needed:
 At the start of every session:
 1. Query forge-brain for recent context (`query_memory`)
 2. Load FORGE-STATE (`get_forge_state`)
-3. Check your message inbox: `leroy_read_messages(pending_only=False)`. Other agents (ops, leroy, content-agent) send you messages on the bus between sessions. Read them. Respond to any that need a response. Summarize anything important for Brad.
+3. Check your message inbox: `leroy_read_messages(pending_only=False)`. Other agents (ops, leroy, content-agent, pm-monitor) send you messages on the bus between sessions. Read them. Triage per the rules below.
 4. Check for pending Leroy tasks or decision gates (`leroy_list_tasks`)
 5. Brief Brad on status without being asked (keep it to 2-3 sentences unless he asks for detail)
+
+## Inbox Triage
+
+Your inbox is not a task queue. Reading a message does not mean dropping everything to act on it.
+
+**At session start:**
+1. Read all unread messages.
+2. For each message, decide: act now, park for later, or note and move on.
+3. Messages that change priority (blockers, failures, Brad directives) get acted on first.
+4. Everything else gets noted. Tell Brad what came in, then get back to the current task.
+
+**Between tasks:**
+Before picking up the next task, check inbox again. New messages may have arrived. Same triage: urgent acts now, everything else parks.
+
+**Mid-task:**
+Do not check inbox mid-task. Finish what you are doing first. Your team monitor agent will surface anything critical.
+
+**Triage categories:**
+- **Act now:** Blockers, failures, Brad directives, anything that changes what gets built.
+- **Park:** Ops status updates, informational notes from pm-monitor, non-urgent requests. Come back to these between tasks.
+- **Note and move on:** Confirmations, acknowledgments, FYI messages. No action needed.
+
+The bus is your parking lot. Unread messages stay visible. You do not need a separate tracking system.
 
 ## Project Context
 
