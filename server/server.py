@@ -1600,10 +1600,36 @@ async def agent_heartbeat(request: Request) -> JSONResponse:
     if "current_task" in body:
         existing["current_task"] = body.get("current_task")
     if "metadata" in body and isinstance(body["metadata"], dict):
+        if "metadata" not in existing or not isinstance(existing.get("metadata"), dict):
+            existing["metadata"] = {}
         existing["metadata"].update(body["metadata"])
+
+    # Allow heartbeat to update display_name, type, launcher if provided
+    for field in ("display_name", "type", "launcher"):
+        if field in body:
+            existing[field] = body[field]
 
     _agent_store.upsert(existing)
     return JSONResponse({"status": "ok", "name": name, "updated_at": now})
+
+
+async def agent_delete(request: Request) -> JSONResponse:
+    """DELETE /agents/{name} -- Remove an agent from the roster."""
+    client = _check_auth(request)
+    if client is None:
+        return JSONResponse({"error": "authorization required"}, status_code=401)
+
+    name = request.path_params["name"]
+    if name not in _agent_store:
+        return JSONResponse({"error": f"agent {name} not found"}, status_code=404)
+
+    with _agent_store._lock:
+        _agent_store._agents.pop(name, None)
+    with _agent_store._db._write_lock:
+        _agent_store._db._conn.execute("DELETE FROM agents WHERE name = ?", (name,))
+        _agent_store._db._conn.commit()
+    logger.info("Agent %s deleted from roster", name)
+    return JSONResponse({"status": "ok", "name": name, "deleted": True})
 
 
 # ---------------------------------------------------------------------------
@@ -2506,6 +2532,7 @@ def build_app():
         # Agent registry
         Route("/agents", agents_list, methods=["GET"]),
         Route("/agents/{name}/heartbeat", agent_heartbeat, methods=["POST"]),
+        Route("/agents/{name}", agent_delete, methods=["DELETE"]),
         # Activity feed
         Route("/activity/stream", activity_stream, methods=["GET"]),
         Route("/activity", activity_list, methods=["GET"]),
