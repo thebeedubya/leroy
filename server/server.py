@@ -86,6 +86,15 @@ _sse_lock = asyncio.Lock()
 # SSE subscribers for activity stream: set of asyncio.Queue instances
 _activity_sse_subscribers: set = set()
 
+# ---------------------------------------------------------------------------
+# Hook event storage (Claude Code hook receivers)
+# ---------------------------------------------------------------------------
+_HOOK_EVENTS_MAX = 5000
+_hook_events: list[dict] = []  # global ring buffer, capped at _HOOK_EVENTS_MAX
+_task_hook_events: dict[str, list[dict]] = {}  # task_id -> list of hook events
+_session_to_task: dict[str, str] = {}  # session_id -> task_id mapping
+_hook_sse_subscribers: list[asyncio.Queue] = []  # SSE subscribers for hook event stream
+
 async def _broadcast_task_update(task_id: str) -> None:
     """Broadcast a task update to all SSE subscribers."""
     if not _sse_subscribers:
@@ -703,14 +712,12 @@ async def tasks_list(request: Request) -> JSONResponse:
         return JSONResponse({"error": "authorization required"}, status_code=401)
 
     status_filter = request.query_params.get("status")
-    # Default: return ALL tasks. Only exclude archived if explicitly requested via ?include_archived=false.
-    exclude_archived = request.query_params.get("include_archived", "").lower() in ("0", "false", "no")
+    # Default: hide archived tasks. Pass ?include_archived=true to see them.
+    include_archived = request.query_params.get("include_archived", "").lower() in ("1", "true", "yes")
     tasks = list(_task_meta.values())
     if status_filter:
-        # Status filter: return all tasks with that status.
         tasks = [t for t in tasks if t["status"] == status_filter]
-    if exclude_archived:
-        # Only hide archived tasks when explicitly asked.
+    if not include_archived:
         tasks = [t for t in tasks if not t.get("archived", False)]
 
     return JSONResponse({"tasks": tasks, "count": len(tasks)})
@@ -768,6 +775,22 @@ async def task_archive(request: Request) -> JSONResponse:
     _task_meta[task_id]["archived_at"] = datetime.now(timezone.utc).isoformat()
     logger.info("Task %s archived", task_id)
     return JSONResponse({"status": "ok", "task_id": task_id, "archived": True})
+
+
+async def task_unarchive(request: Request) -> JSONResponse:
+    """POST /tasks/{task_id}/unarchive -- Restore an archived task to default views."""
+    client = _check_auth(request)
+    if client is None:
+        return JSONResponse({"error": "authorization required"}, status_code=401)
+
+    task_id = request.path_params["task_id"]
+    if task_id not in _task_meta:
+        return JSONResponse({"error": f"task {task_id} not found"}, status_code=404)
+
+    _task_meta[task_id]["archived"] = False
+    _task_meta[task_id].pop("archived_at", None)
+    logger.info("Task %s unarchived", task_id)
+    return JSONResponse({"status": "ok", "task_id": task_id, "archived": False})
 
 
 async def task_review(request: Request) -> JSONResponse:
@@ -2224,6 +2247,211 @@ health_app = Starlette(routes=[Route("/health", health)])
 
 
 # ---------------------------------------------------------------------------
+# Claude Code Hook Receiver endpoints
+# ---------------------------------------------------------------------------
+
+def _correlate_session_to_task(session_id: str) -> str | None:
+    """Try to map a Claude Code session_id to an active task_id.
+
+    First checks the cache. If not found, scans tasks in 'working' status
+    that have active PIDs and assigns the first match. Returns None if no
+    correlation can be made.
+    """
+    if session_id in _session_to_task:
+        return _session_to_task[session_id]
+
+    # Heuristic: find working tasks with active PIDs
+    for task_id, pid in list(_active_pids.items()):
+        if task_id not in _session_to_task.values():
+            _session_to_task[session_id] = task_id
+            logger.info("Hook: correlated session %s -> task %s (PID %d)", session_id[:12], task_id[:8], pid)
+            return task_id
+    return None
+
+
+def _store_hook_event(event: dict, task_id: str | None) -> None:
+    """Store a hook event in the global buffer and per-task index. Push to SSE subscribers."""
+    # Global buffer with cap
+    _hook_events.append(event)
+    if len(_hook_events) > _HOOK_EVENTS_MAX:
+        # Drop oldest events
+        excess = len(_hook_events) - _HOOK_EVENTS_MAX
+        del _hook_events[:excess]
+
+    # Per-task index
+    if task_id:
+        if task_id not in _task_hook_events:
+            _task_hook_events[task_id] = []
+        _task_hook_events[task_id].append(event)
+
+    # Broadcast to SSE subscribers
+    event_data = json.dumps({"type": "hook_event", "event": event})
+    dead = []
+    for i, queue in enumerate(list(_hook_sse_subscribers)):
+        try:
+            queue.put_nowait(event_data)
+        except (asyncio.QueueFull, Exception):
+            dead.append(queue)
+    for q in dead:
+        try:
+            _hook_sse_subscribers.remove(q)
+        except ValueError:
+            pass
+
+
+async def hooks_tool_use(request: Request) -> JSONResponse:
+    """POST /hooks/tool-use -- Receives PreToolUse/PostToolUse events from Claude Code hooks.
+
+    No auth required (localhost only).
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+
+    session_id = body.get("session_id", "")
+    task_id = _correlate_session_to_task(session_id) if session_id else None
+
+    event = {
+        "event_type": "tool_use",
+        "session_id": session_id,
+        "task_id": task_id,
+        "cwd": body.get("cwd", ""),
+        "hook_event_name": body.get("hook_event_name", ""),
+        "tool_name": body.get("tool_name", ""),
+        "tool_input": body.get("tool_input"),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+    _store_hook_event(event, task_id)
+    logger.debug(
+        "Hook tool-use: %s %s (session=%s, task=%s)",
+        event["hook_event_name"], event["tool_name"],
+        session_id[:12] if session_id else "?",
+        task_id[:8] if task_id else "none",
+    )
+    return JSONResponse({"status": "ok"})
+
+
+async def hooks_subagent(request: Request) -> JSONResponse:
+    """POST /hooks/subagent -- Receives SubagentStart/SubagentStop events from Claude Code hooks.
+
+    No auth required (localhost only).
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+
+    session_id = body.get("session_id", "")
+    task_id = _correlate_session_to_task(session_id) if session_id else None
+
+    event = {
+        "event_type": "subagent",
+        "session_id": session_id,
+        "task_id": task_id,
+        "cwd": body.get("cwd", ""),
+        "hook_event_name": body.get("hook_event_name", ""),
+        "subagent_id": body.get("subagent_id", ""),
+        "subagent_type": body.get("subagent_type", ""),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+    # For SubagentStart, register the subagent's session so its child tool calls also correlate
+    if body.get("hook_event_name") == "SubagentStart" and body.get("subagent_id") and task_id:
+        _session_to_task[body["subagent_id"]] = task_id
+        logger.debug("Hook: registered subagent %s -> task %s", body["subagent_id"][:12], task_id[:8])
+
+    _store_hook_event(event, task_id)
+    logger.debug(
+        "Hook subagent: %s %s (session=%s, task=%s)",
+        event["hook_event_name"], event.get("subagent_id", "")[:12],
+        session_id[:12] if session_id else "?",
+        task_id[:8] if task_id else "none",
+    )
+    return JSONResponse({"status": "ok"})
+
+
+async def hooks_events_list(request: Request) -> JSONResponse:
+    """GET /hooks/events -- Retrieve hook events, optionally filtered by task_id.
+
+    Query params:
+      ?task_id=<id>   -- filter events for a specific task
+      ?limit=100      -- max events to return (default 100)
+      ?since=<iso>    -- only return events after this ISO timestamp
+    """
+    task_id = request.query_params.get("task_id")
+    limit = int(request.query_params.get("limit", "100"))
+    since = request.query_params.get("since")
+
+    if task_id:
+        events = list(_task_hook_events.get(task_id, []))
+    else:
+        events = list(_hook_events)
+
+    # Filter by since timestamp
+    if since:
+        events = [e for e in events if e.get("timestamp", "") > since]
+
+    # Return most recent events up to limit
+    events = events[-limit:]
+
+    return JSONResponse({"events": events, "count": len(events)})
+
+
+async def hooks_events_stream(request: Request) -> StreamingResponse:
+    """GET /hooks/events/stream -- SSE endpoint for real-time hook events.
+
+    Query params:
+      ?task_id=<id>   -- filter for a specific task
+
+    Streams events as SSE data lines. Heartbeat every 15 seconds.
+    """
+    task_id_filter = request.query_params.get("task_id")
+    queue: asyncio.Queue = asyncio.Queue(maxsize=500)
+    _hook_sse_subscribers.append(queue)
+
+    async def event_generator():
+        try:
+            while True:
+                try:
+                    data = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    # Apply task_id filter if specified
+                    if task_id_filter:
+                        try:
+                            parsed = json.loads(data)
+                            evt = parsed.get("event", {})
+                            if evt.get("task_id") != task_id_filter:
+                                continue
+                        except Exception:
+                            pass
+                    yield f"data: {data}\n\n"
+                except asyncio.TimeoutError:
+                    heartbeat = json.dumps({
+                        "type": "heartbeat",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
+                    yield f"data: {heartbeat}\n\n"
+        except Exception:
+            pass
+        finally:
+            try:
+                _hook_sse_subscribers.remove(queue)
+            except ValueError:
+                pass
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
 # Build combined ASGI app
 # ---------------------------------------------------------------------------
 def build_app():
@@ -2252,6 +2480,7 @@ def build_app():
         Route("/tasks/{task_id}/accept", task_accept, methods=["POST"]),
         Route("/tasks/{task_id}/cancel", task_cancel, methods=["POST"]),
         Route("/tasks/{task_id}/archive", task_archive, methods=["POST"]),
+        Route("/tasks/{task_id}/unarchive", task_unarchive, methods=["POST"]),
         Route("/tasks/{task_id}/review", task_review, methods=["POST"]),
         Route("/tasks/{task_id}", task_delete, methods=["DELETE"]),
         Route("/tasks/{task_id}/logs", task_logs, methods=["GET"]),
@@ -2297,6 +2526,11 @@ def build_app():
         Route("/infra/status", infra_status, methods=["GET"]),
         # Admin
         Route("/admin/circuit-reset", admin_circuit_reset, methods=["POST"]),
+        # Claude Code hook receivers (no auth -- localhost only)
+        Route("/hooks/tool-use", hooks_tool_use, methods=["POST"]),
+        Route("/hooks/subagent", hooks_subagent, methods=["POST"]),
+        Route("/hooks/events/stream", hooks_events_stream, methods=["GET"]),
+        Route("/hooks/events", hooks_events_list, methods=["GET"]),
     ]
 
     # Prepend custom routes before A2A routes

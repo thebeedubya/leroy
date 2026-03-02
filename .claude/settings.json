@@ -12,5 +12,41 @@
       "Grep",
       "Write"
     ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Edit|Write|Read|Agent",
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://localhost:9800/hooks/tool-use",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://localhost:9800/hooks/subagent",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://localhost:9800/hooks/subagent",
+            "async": true
+          }
+        ]
+      }
+    ]
   }
 }
