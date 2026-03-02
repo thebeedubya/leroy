@@ -249,7 +249,7 @@ def _run_claude_sync(task_id: str, spec: str) -> None:
                 stderr=subprocess.PIPE,
                 text=True,
                 cwd=WORK_DIR,
-                env={**os.environ, "CLAUDE_CODE_ENTRYPOINT": "leroy-a2a", "LEROY_TASK_ID": task_id},
+                env={k: v for k, v in os.environ.items() if k != "CLAUDECODE"} | {"CLAUDE_CODE_ENTRYPOINT": "leroy-a2a", "LEROY_TASK_ID": task_id},
                 start_new_session=True,
             )
             _active_pids[task_id] = proc.pid
@@ -739,7 +739,7 @@ async def task_cancel(request: Request) -> JSONResponse:
     if task_id not in _task_meta:
         return JSONResponse({"error": f"task {task_id} not found"}, status_code=404)
 
-    if _task_meta[task_id]["status"] not in ("pending", "working"):
+    if _task_meta[task_id]["status"] not in ("pending", "working", "idea"):
         return JSONResponse(
             {"error": f"task {task_id} cannot be cancelled (status: {_task_meta[task_id]['status']})"},
             status_code=409,
@@ -1366,10 +1366,13 @@ def _stuck_task_detector() -> None:
                                     logger.info("STUCK TASK %s: SIGTERM skipped (%s)", task_id, kill_err)
                                 _active_pids.pop(task_id, None)
 
-                            meta["status"] = "completed"
-                            meta["completed_at"] = now_iso
-                            if not meta.get("result"):
-                                meta["result"] = (
+                            # Write back through PersistentTaskDict so it persists to SQLite.
+                            # meta from items() is a plain dict copy -- must use _task_meta[task_id].
+                            tracked = _task_meta[task_id]
+                            tracked["status"] = "completed"
+                            tracked["completed_at"] = now_iso
+                            if not tracked.get("result"):
+                                tracked["result"] = (
                                     f"[Auto-completed by stuck detector after {int(elapsed)}s. "
                                     f"All {len(subtasks)} subtasks finished. "
                                     f"See logs/{task_id}.log for full output.]"
@@ -1387,7 +1390,6 @@ def _stuck_task_detector() -> None:
                                 ),
                                 "requires_response": False,
                             })
-                            meta["_stuck_resolved"] = True
                             logger.info("STUCK TASK %s: auto-completed successfully", task_id)
 
                 # Check 2: subprocess PID liveness (only for server-spawned tasks)
@@ -1826,6 +1828,100 @@ async def proposals_reject(request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
+# Ideas endpoints
+# ---------------------------------------------------------------------------
+
+async def ideas_create(request: Request) -> JSONResponse:
+    """POST /ideas -- Create an idea task (lightweight backlog placeholder).
+
+    Body: {"title": "Short idea title", "description": "Optional one-liner"}
+    Returns: created task with status "idea" and task_id.
+    Ideas do NOT trigger auto-execution.
+    """
+    client = _check_auth(request)
+    if client is None:
+        return JSONResponse({"error": "authorization required"}, status_code=401)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+
+    title = (body.get("title") or "").strip()
+    if not title:
+        return JSONResponse({"error": "title required"}, status_code=400)
+
+    description = (body.get("description") or "").strip()
+    task_id = uuid4().hex
+    now = datetime.now(timezone.utc).isoformat()
+
+    task = {
+        "task_id": task_id,
+        "spec": title,
+        "description": description,
+        "status": "idea",
+        "result": None,
+        "created_at": now,
+        "completed_at": None,
+    }
+    _task_meta[task_id] = task
+    _broadcast_task_update_sync(task_id)
+
+    _emit_activity("pm", "idea_created", f"Idea created: {title[:80]}", task_id=task_id)
+    logger.info("Idea created: %s -- %s", task_id, title[:60])
+
+    return JSONResponse(dict(_task_meta[task_id]), status_code=201)
+
+
+async def ideas_promote(request: Request) -> JSONResponse:
+    """POST /ideas/{task_id}/promote -- Promote an idea to pending.
+
+    Changes status from "idea" to "pending".
+    Optional body: {"spec": "# Full spec markdown..."} to replace the placeholder spec.
+    If no spec body, the idea title becomes the spec.
+    Does NOT trigger auto-execution -- task sits in pending until picked up by Leroy CLI.
+    """
+    client = _check_auth(request)
+    if client is None:
+        return JSONResponse({"error": "authorization required"}, status_code=401)
+
+    task_id = request.path_params["task_id"]
+    if task_id not in _task_meta:
+        return JSONResponse({"error": f"task {task_id} not found"}, status_code=404)
+
+    if _task_meta[task_id]["status"] != "idea":
+        return JSONResponse(
+            {"error": f"task {task_id} cannot be promoted (status: {_task_meta[task_id]['status']})"},
+            status_code=409,
+        )
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    # If a spec is provided, replace the placeholder
+    if body.get("spec"):
+        _task_meta[task_id]["spec"] = body["spec"]
+
+    _task_meta[task_id]["status"] = "pending"
+    _task_meta[task_id]["promoted_at"] = datetime.now(timezone.utc).isoformat()
+
+    logger.info("Idea %s promoted to pending", task_id)
+    _broadcast_task_update_sync(task_id)
+    _emit_activity("pm", "idea_promoted",
+                   f"Idea promoted to pending: {_task_meta[task_id]['spec'][:60]}",
+                   task_id=task_id)
+
+    return JSONResponse({
+        "status": "ok",
+        "task_id": task_id,
+        "new_status": "pending",
+        "task": dict(_task_meta[task_id]),
+    })
+
+
+# ---------------------------------------------------------------------------
 # Specs pipeline endpoint
 # ---------------------------------------------------------------------------
 
@@ -1978,7 +2074,7 @@ async def brain_health(request: Request) -> JSONResponse:
 
     return JSONResponse({
         "status": "unreachable",
-        "error": last_error if "last_error" in dir() else "all health URLs failed",
+        "error": last_error if "last_error" in locals() else "all health URLs failed",
         "circuit_breaker": _persist_manager.circuit_state,
         "persist_queue_depth": _persist_manager.queue_depth(),
         "dead_letter_depth": _persist_manager.dead_letter_depth(),
@@ -2019,15 +2115,15 @@ _INFRA_TOPOLOGY = [
         "ip": "155.138.199.82",
         "role": "Carric Infrastructure (CloudRaider)",
         "services": [
-            {"name": "A2A Gateway", "port": 8443, "path": "/health"},
+            {"name": "A2A Gateway", "port": 8443, "path": "/health", "protocol": "https"},
         ],
     },
 ]
 
 
-def _ping_service(ip: str, port: int, path: str, timeout: float = 2.0) -> dict:
-    """Attempt an HTTP GET to ip:port/path. Returns status dict."""
-    url = f"http://{ip}:{port}{path}"
+def _ping_service(ip: str, port: int, path: str, timeout: float = 2.0, protocol: str = "http") -> dict:
+    """Attempt an HTTP/HTTPS GET to ip:port/path. Returns status dict."""
+    url = f"{protocol}://{ip}:{port}{path}"
     start = time.time()
     try:
         req = urllib.request.Request(url)
@@ -2044,39 +2140,34 @@ def _ping_service(ip: str, port: int, path: str, timeout: float = 2.0) -> dict:
 
 
 async def infra_status(request: Request) -> JSONResponse:
-    """GET /infra/status -- Returns infrastructure status with health pings."""
+    """GET /infra/status -- Returns infrastructure status with health pings (parallel)."""
     now = datetime.now(timezone.utc).isoformat()
     loop = asyncio.get_event_loop()
-    result = []
 
-    for machine in _INFRA_TOPOLOGY:
-        service_results = []
-        machine_up = False
+    async def ping_svc(machine, svc):
+        protocol = svc.get("protocol", "http")
+        svc_status = await loop.run_in_executor(
+            None, _ping_service, machine["ip"], svc["port"], svc["path"], 2.0, protocol
+        )
+        return {"name": svc["name"], "port": svc["port"], **svc_status}
 
-        for svc in machine["services"]:
-            # Run blocking ping in thread pool to avoid blocking event loop
-            svc_status = await loop.run_in_executor(
-                None, _ping_service, machine["ip"], svc["port"], svc["path"]
-            )
-            service_results.append({
-                "name": svc["name"],
-                "port": svc["port"],
-                **svc_status,
-            })
-            if svc_status["status"] == "up":
-                machine_up = True
-
-        result.append({
+    async def ping_machine(machine):
+        service_results = await asyncio.gather(
+            *[ping_svc(machine, svc) for svc in machine["services"]]
+        )
+        machine_up = any(s["status"] == "up" for s in service_results)
+        return {
             "name": machine["name"],
             "hostname": machine["hostname"],
             "ip": machine["ip"],
             "role": machine["role"],
             "status": "up" if machine_up else "down",
-            "services": service_results,
+            "services": list(service_results),
             "checked_at": now,
-        })
+        }
 
-    return JSONResponse({"machines": result, "checked_at": now})
+    result = await asyncio.gather(*[ping_machine(m) for m in _INFRA_TOPOLOGY])
+    return JSONResponse({"machines": list(result), "checked_at": now})
 
 
 # ---------------------------------------------------------------------------
@@ -2195,6 +2286,9 @@ def build_app():
         Route("/pm/proposals/{proposal_id}/reject", proposals_reject, methods=["POST"]),
         Route("/pm/proposals", proposals_create, methods=["POST"]),
         Route("/pm/proposals", proposals_list, methods=["GET"]),
+        # Ideas (backlog placeholders)
+        Route("/ideas/{task_id}/promote", ideas_promote, methods=["POST"]),
+        Route("/ideas", ideas_create, methods=["POST"]),
         # Specs pipeline
         Route("/specs", specs_list, methods=["GET"]),
         # Brain health proxy
