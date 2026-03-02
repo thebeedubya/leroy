@@ -101,6 +101,15 @@ PM response: APPROVE (proceed to deploy) | SEND BACK (specific items to address)
 - Health checks passing
 - No regression in existing functionality
 
+### Step 14.5 -- Document (NBL)
+- Generate a narrative summary of the sprint: what was built, why, key decisions, what changed, architectural impact
+- NOT raw code — a human-readable explanation suitable for team consumption
+- Push to the project's internal notebook via `notebooklm_add_text` MCP tool
+- If no project notebook exists, create one via `notebooklm_create_notebook`: `[Project Name] Internal`
+- Title format: `Sprint: [subject] - [date]`
+- Content should explain the "what and why" without exposing sensitive implementation details
+- Include: problem statement, approach chosen, key files modified, architectural decisions, testing results
+
 ### Step 15 -- Persist
 - Record outcomes to brain (what was built, why, decisions made)
 - Record lessons learned (record_lesson for problems/solutions)

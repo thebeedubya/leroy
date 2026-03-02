@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.forge.pm-monitor</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/python3</string>
+        <string>/Users/brad.wood/Projects/leroy/monitor/pm_monitor.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/brad.wood/Projects/leroy</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/brad.wood/Projects/leroy/data/pm-monitor-stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/brad.wood/Projects/leroy/data/pm-monitor-stderr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/brad.wood/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>/Users/brad.wood</string>
+        <key>PYTHONPATH</key>
+        <string>/Users/brad.wood/Projects/leroy/server</string>
+        <key>LEROY_A2A_TOKEN</key>
+        <string>LEROY_A2A_TOKEN_REDACTED</string>
+        <key>PM_HEADLESS_ENABLED</key>
+        <string>true</string>
+        <key>PM_MONITOR_MAX_SPAWNS</key>
+        <string>10</string>
+        <key>PM_HEADLESS_MAX_TURNS</key>
+        <string>20</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+</dict>
+</plist>

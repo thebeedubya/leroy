@@ -1,0 +1,133 @@
+# Daily Media Brief: YYYY-MM-DD
+
+## Yesterday's Summary
+
+[2-3 sentences. What happened yesterday that was compelling. Honest assessment.]
+
+**Content angles found**: N
+**Sessions analyzed**: N
+**Aianna queries run**: 6 (+ lessons + state)
+
+---
+
+## Content Angle 1: [Theme Name]
+
+**Post-Worthiness Score**: X/10
+**Target Angle**: [one-line thesis]
+**Source Sessions**: [session IDs]
+**Aianna Confidence**: [high / medium / low]
+**Status:** draft
+**Posted URLs:**
+
+### Blog Post (dbradwood.com)
+
+---
+title: [Title]
+slug: [url-slug]
+meta_description: [150-160 char description]
+seo_keywords: [keyword1, keyword2, keyword3]
+date: YYYY-MM-DD
+source_sessions: [session IDs]
+---
+
+[Full blog post content in markdown, 500-800 words]
+
+---
+
+### LinkedIn
+
+[LinkedIn post, 1000-1300 characters.
+First line is the hook — no "I" to start.
+4-6 short paragraphs.
+3-5 hashtags at end only.]
+
+---
+
+### X Thread
+
+1/ [hook tweet — under 240 chars, stands alone]
+
+2/ [second beat — concrete, specific]
+
+3/ [third beat]
+
+4/ [fourth beat]
+
+5/ [optional fifth beat]
+
+6/ [landing tweet + blog link placeholder]
+
+---
+
+### Instagram
+
+CAPTION:
+[150-200 word caption. Opens with scene-setting. Ends with CTA (link in bio).]
+
+#hashtag1 #hashtag2 #hashtag3 #hashtag4 #hashtag5 #hashtag6 #hashtag7
+
+CAROUSEL:
+Slide 1: [Hook/title — big bold claim]
+Slide 2: [Point 1 heading] — [supporting line]
+Slide 3: [Point 2 heading] — [supporting line]
+Slide 4: [Point 3 heading] — [supporting line]
+Slide 5: [Point 4 heading] — [supporting line]
+Last Slide: [CTA] — @dbradwood | dbradwood.com
+
+**Image:** needed
+
+---
+
+## Content Angle 2: [Theme Name]
+
+**Post-Worthiness Score**: X/10
+**Target Angle**: [one-line thesis]
+**Source Sessions**: [session IDs]
+**Aianna Confidence**: [high / medium / low]
+**Status:** draft
+**Posted URLs:**
+
+### Blog Post (dbradwood.com)
+
+[content]
+
+---
+
+### LinkedIn
+
+[content]
+
+---
+
+### X Thread
+
+[content]
+
+---
+
+### Instagram
+
+CAPTION:
+[content]
+
+CAROUSEL:
+[content]
+
+**Image:** needed
+
+---
+
+## Aianna Query Log
+
+| Query | Results Returned | Yesterday's Sessions Found |
+|-------|-----------------|---------------------------|
+| Milestones/completions | N | N |
+| Architecture decisions | N | N |
+| Cross-agent activity | N | N |
+| Emotional high points | N | N |
+| Brad building narrative | N | N |
+| Problems solved | N | N |
+| Lessons (query_lessons) | N | N |
+
+**Forge State loaded**: yes/no
+**Aianna errors/retries**: none

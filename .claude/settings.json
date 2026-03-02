@@ -1,14 +1,16 @@
 {
   "permissions": {
     "allow": [
-      "mcp__forge-brain__*",
+      "mcp__aianna__*",
       "mcp__a2a__*",
+      "mcp__leroy__*",
       "mcp__youtube-transcript__*",
       "WebSearch",
       "WebFetch",
       "Read",
       "Glob",
-      "Grep"
+      "Grep",
+      "Write"
     ]
   }
 }

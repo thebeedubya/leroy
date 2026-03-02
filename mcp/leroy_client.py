@@ -168,6 +168,41 @@ async def leroy_send_spec(spec: str, subject: str = "") -> str:
     Returns:
         Task ID and confirmation message.
     """
+    # ---------------------------------------------------------------------------
+    # Retro gate: block submission if any completed specs are missing retros
+    # ---------------------------------------------------------------------------
+    override = "RETRO_OVERRIDE" in subject
+    retro_debt: list[tuple[str, str]] = []  # (filename, task_id)
+
+    for f in _get_recent_spec_files(20):
+        try:
+            fm_content = f.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        fm = _parse_frontmatter(fm_content)
+        fm_status = fm.get("status", "")
+        fm_retro = fm.get("retrospective", "")
+        if fm_status == "completed" and (not fm_retro or fm_retro.strip() == "(pending)"):
+            retro_debt.append((f.name, fm.get("task_id", "(unknown)")))
+
+    if retro_debt and not override:
+        debt_lines = "\n".join(
+            f"  - {name} (task: {tid})" for name, tid in retro_debt
+        )
+        return (
+            f"BLOCKED: {len(retro_debt)} spec(s) missing retrospectives. "
+            f"Write retros before sending new specs.\n\n"
+            f"Missing retros:\n{debt_lines}\n\n"
+            f"Use leroy_update_spec(task_id, pass_rate, retrospective) to write each retro.\n"
+            f'To override (emergency only): include "RETRO_OVERRIDE" in the spec subject.'
+        )
+
+    override_warning = (
+        f"\nWARNING: Retro gate overridden. You still owe {len(retro_debt)} retrospective(s).\n"
+        if override and retro_debt
+        else ""
+    )
+
     today = date.today().isoformat()
     slug = _derive_slug(subject)
     spec_path = _unique_spec_path(today, slug)
@@ -248,8 +283,9 @@ async def leroy_send_spec(spec: str, subject: str = "") -> str:
     return (
         f"Spec sent to Leroy{subject_line}. Task ID: {task_id}\n"
         f"Spec saved: {spec_path.name}\n"
-        f"Leroy is working on it. Check progress with: leroy_check_task('{task_id}')\n\n"
-        f"{recent_summary}"
+        f"Leroy is working on it. Check progress with: leroy_check_task('{task_id}')\n"
+        f"{override_warning}"
+        f"\n{recent_summary}"
     )
 
 
@@ -417,7 +453,7 @@ async def leroy_list_tasks(status: str = "") -> str:
         if len(t.get("spec", "")) > 80:
             spec_preview += "..."
         lines.append(
-            f"  [{t['status'].upper():>10}] {t['task_id'][:12]}... "
+            f"  [{t['status'].upper():>10}] {t['task_id']} "
             f"| {spec_preview}"
         )
 
@@ -462,7 +498,7 @@ async def leroy_read_messages(pending_only: bool = True) -> str:
     Returns:
         List of messages with IDs, types, and content.
     """
-    endpoint = "/pm/messages/pending" if pending_only else "/pm/messages"
+    endpoint = "/messages?to=pm&pending=true" if pending_only else "/messages?to=pm"
     async with httpx.AsyncClient(timeout=10) as client:
         try:
             resp = await client.get(
@@ -486,25 +522,24 @@ async def leroy_read_messages(pending_only: bool = True) -> str:
         msg_id = msg.get("message_id", "unknown")
         msg_type = msg.get("type", "unknown").upper()
         task_id = msg.get("task_id", "unknown")
+        sender = msg.get("from", "unknown")
         content = msg.get("content", "")
-        options = msg.get("options", [])
         context = msg.get("context", "")
         requires_response = msg.get("requires_response", False)
         responded = msg.get("responded", False)
-        ts = msg.get("received_at", msg.get("timestamp", ""))[:19].replace("T", " ")
+        ts = msg.get("created_at", "")[:19].replace("T", " ")
 
         lines.append(f"[{msg_type}] message_id: {msg_id}")
+        lines.append(f"  From: {sender}")
         lines.append(f"  Task: {task_id}")
         lines.append(f"  Time: {ts}")
         lines.append(f"  Content: {content}")
         if context:
             lines.append(f"  Context: {context}")
-        if options:
-            lines.append(f"  Options: {', '.join(options)}")
         if requires_response and not responded:
             lines.append(f"  ** AWAITING YOUR RESPONSE -- use leroy_reply_to_message('{msg_id}', ...) **")
         elif responded:
-            lines.append(f"  [RESPONDED: {msg.get('pm_response', '')}]")
+            lines.append(f"  [RESPONDED: {msg.get('response', '')}]")
         lines.append("")
 
     return "\n".join(lines)
@@ -525,12 +560,13 @@ async def leroy_reply_to_message(message_id: str, response: str) -> str:
         Confirmation that Leroy has been unblocked.
     """
     payload = {
-        "response": response,
+        "from": "pm",
+        "content": response,
     }
     async with httpx.AsyncClient(timeout=10) as client:
         try:
             resp = await client.post(
-                f"{_a2a_url()}/pm/messages/{message_id}/respond",
+                f"{_a2a_url()}/messages/{message_id}/respond",
                 headers=_headers(),
                 json=payload,
             )
@@ -667,7 +703,7 @@ async def leroy_health() -> str:
             return f"Leroy A2A server health check failed: {e}"
 
     tasks = data.get("tasks", {})
-    pm_msgs = data.get("pm_messages", {})
+    msgs = data.get("messages", {})
     persist = data.get("persistence", {})
     lines = [
         f"Status: {data.get('status', 'unknown')}",
@@ -682,11 +718,14 @@ async def leroy_health() -> str:
         f"{tasks.get('failed', 0)} failed",
     ]
 
-    if pm_msgs:
-        lines.append(
-            f"PM Messages: {pm_msgs.get('pending_pm_response', 0)} awaiting response, "
-            f"webhook={'registered' if pm_msgs.get('pm_webhook_registered') else 'offline'}"
-        )
+    if msgs:
+        lines.append(f"Messages: {msgs.get('total_pending', 0)} total pending")
+        agents = msgs.get("agents", {})
+        for name, counts in agents.items():
+            lines.append(
+                f"  [{name}]: {counts.get('unread', 0)} unread, "
+                f"{counts.get('pending', 0)} awaiting response"
+            )
 
     if persist:
         lines.append(
@@ -694,6 +733,56 @@ async def leroy_health() -> str:
         )
 
     return "\n".join(lines)
+
+
+@mcp.tool()
+async def leroy_send_message(to: str, content: str, msg_type: str = "request",
+                              task_id: str = "") -> str:
+    """Send a message to any agent on the bus.
+
+    Use this to communicate with ops, leroy, content-agent, or any registered agent.
+    Messages are delivered to the recipient's inbox on the agent message bus.
+
+    Args:
+        to: Recipient agent name (e.g. "ops", "leroy", "content-agent").
+        content: The message text.
+        msg_type: Message type: "request", "question", "status_update", "alert".
+                  Default "request".
+        task_id: Optional task ID to link the message to.
+
+    Returns:
+        Confirmation with message ID.
+    """
+    payload = {
+        "from": "pm",
+        "to": to,
+        "type": msg_type,
+        "content": content,
+    }
+    if task_id:
+        payload["task_id"] = task_id
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        try:
+            resp = await client.post(
+                f"{_a2a_url()}/messages",
+                headers=_headers(),
+                json=payload,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except httpx.ConnectError:
+            return "Cannot reach Leroy A2A server. Is it running on port 9800?"
+        except Exception as e:
+            return f"Error sending message: {e}"
+
+    msg_id = data.get("message_id", "unknown")
+    return (
+        f"Message sent to {to}.\n"
+        f"Message ID: {msg_id}\n"
+        f"Type: {msg_type}\n"
+        f"Content: {content[:100]}"
+    )
 
 
 if __name__ == "__main__":

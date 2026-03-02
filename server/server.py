@@ -9,11 +9,14 @@ import asyncio
 import json
 import logging
 import os
+import selectors
 import signal
 import shutil
 import subprocess
 import sys
 import time
+import urllib.request
+import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -41,7 +44,8 @@ from a2a.utils import new_agent_text_message
 import config
 import auth
 import persist_manager as pm
-import message_broker as broker
+import message_broker as broker  # legacy, kept for backward compat during migration
+import agent_bus
 import task_db
 
 # ---------------------------------------------------------------------------
@@ -71,9 +75,16 @@ _task_meta: task_db.PersistentTaskDict | None = None  # set in main()
 # Also backed by SQLite via task_db.
 _subtask_store: task_db.PersistentSubtaskStore | None = None  # set in main()
 
+# Agent registry and activity event store -- set in main()
+_agent_store: task_db.AgentStore | None = None
+_activity_store: task_db.ActivityStore | None = None
+
 # SSE subscribers: set of asyncio.Queue instances for broadcasting task updates
 _sse_subscribers: set = set()
 _sse_lock = asyncio.Lock()
+
+# SSE subscribers for activity stream: set of asyncio.Queue instances
+_activity_sse_subscribers: set = set()
 
 async def _broadcast_task_update(task_id: str) -> None:
     """Broadcast a task update to all SSE subscribers."""
@@ -110,6 +121,24 @@ def _broadcast_task_update_sync(task_id: str) -> None:
     for q in dead:
         _sse_subscribers.discard(q)
 
+def _emit_activity(agent: str, event_type: str, summary: str,
+                   detail: str | None = None, task_id: str | None = None,
+                   severity: str = "info") -> None:
+    """Emit an activity event and broadcast to SSE subscribers."""
+    if _activity_store is None:
+        return
+    evt = _activity_store.append(agent, event_type, summary, detail, task_id, severity)
+    evt_data = json.dumps({"type": "activity_event", "event": evt})
+    dead = set()
+    for queue in list(_activity_sse_subscribers):
+        try:
+            queue.put_nowait(evt_data)
+        except Exception:
+            dead.add(queue)
+    for q in dead:
+        _activity_sse_subscribers.discard(q)
+
+
 # Persistence manager -- persists task completions to Aianna (forge-brain)
 _persist_manager = pm.PersistenceManager()
 
@@ -120,6 +149,13 @@ _persist_manager = pm.PersistenceManager()
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", shutil.which("claude") or "claude")
 WORK_DIR = os.environ.get("LEROY_WORK_DIR", str(Path(__file__).parent.parent))
 MAX_TASK_TIMEOUT = int(os.environ.get("LEROY_TASK_TIMEOUT", "3600"))  # 1 hour default
+LOGS_DIR = Path(WORK_DIR) / "logs"
+LOGS_DIR.mkdir(exist_ok=True)
+
+# Stuck task detection settings
+_STUCK_CHECK_INTERVAL = 60  # seconds between checks
+_STUCK_THRESHOLD = 120  # seconds after all subtasks done before flagging as stuck
+_active_pids: dict[str, int] = {}  # task_id -> subprocess PID for liveness checks
 
 # System prompt injected into every claude -p invocation
 LEROY_SYSTEM_PROMPT = """You are Leroy, the Engineering Lead for the FORGE ecosystem.
@@ -131,19 +167,23 @@ Execute the spec completely. Return a structured result with:
 - Any issues encountered
 Be thorough but concise. No filler.
 
-When you need to communicate with PM during task execution, use the PM messaging API:
+When you need to communicate with PM during task execution, use the agent message bus:
 
-  POST http://127.0.0.1:9800/pm/messages
+  POST http://127.0.0.1:9800/messages
   Content-Type: application/json
   Body: {
+    "from": "leroy",
+    "to": "pm",
     "type": "question|status_update|decision_gate|blocker|deliverable_ready",
     "task_id": "<your LEROY_TASK_ID env var>",
     "content": "your message text",
-    "options": ["option1", "option2"],  // for decision_gate only
     "context": "relevant background for PM",
     "requires_response": true|false
   }
   Returns: {"message_id": "...", "status": "queued"}
+
+You can also message Ops for infrastructure requests:
+  {"from": "leroy", "to": "ops", "type": "request", "content": "restart dashboard"}
 
 Message types:
 - status_update: non-blocking progress report, continues immediately
@@ -152,8 +192,8 @@ Message types:
 - decision_gate: BLOCKING -- PM picks from options before you continue
 - blocker: BLOCKING -- you cannot proceed without PM input
 
-For BLOCKING messages, after POSTing, poll for PM's response:
-  GET http://127.0.0.1:9800/pm/messages/{message_id}/response
+For BLOCKING messages, after POSTing, poll for the response:
+  GET http://127.0.0.1:9800/messages/{message_id}/response
   Poll every 5 seconds. Max wait 10 minutes.
   Returns: {"status": "pending"} or {"status": "answered", "response": "..."}
 
@@ -178,39 +218,182 @@ Sub-task reporting: When you decompose work into sub-tasks and delegate to speci
 
 
 def _run_claude_sync(task_id: str, spec: str) -> None:
-    """Run claude -p in a subprocess. Called from a background thread."""
-    logger.info("Task %s: spawning claude -p (timeout=%ds)", task_id, MAX_TASK_TIMEOUT)
+    """Run claude -p in a subprocess with real-time log streaming."""
+    log_file = LOGS_DIR / f"{task_id}.log"
+    logger.info("Task %s: spawning claude -p (timeout=%ds, log=%s)", task_id, MAX_TASK_TIMEOUT, log_file)
     _task_meta[task_id]["status"] = "working"
+    _task_meta[task_id]["log_file"] = str(log_file)
+    _task_meta[task_id]["last_activity"] = datetime.now(timezone.utc).isoformat()
     _broadcast_task_update_sync(task_id)
 
     proc = None
     try:
-        # Start in a new process group so we can kill the whole tree on timeout
-        proc = subprocess.Popen(
-            [
-                CLAUDE_BIN,
-                "-p", spec,
-                "--output-format", "text",
-                "--system-prompt", LEROY_SYSTEM_PROMPT,
-                "--dangerously-skip-permissions",
-                "--no-session-persistence",
-                "--model", "sonnet",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            cwd=WORK_DIR,
-            env={**os.environ, "CLAUDE_CODE_ENTRYPOINT": "leroy-a2a", "LEROY_TASK_ID": task_id},
-            start_new_session=True,  # new process group
-        )
+        with open(log_file, "w") as lf:
+            lf.write(f"=== Task {task_id} started at {datetime.now(timezone.utc).isoformat()} ===\n")
+            lf.write(f"=== Spec length: {len(spec)} chars ===\n\n")
+            lf.flush()
 
-        stdout, stderr = proc.communicate(timeout=MAX_TASK_TIMEOUT)
+            # Start in a new process group so we can kill the whole tree on timeout
+            proc = subprocess.Popen(
+                [
+                    CLAUDE_BIN,
+                    "-p", spec,
+                    "--output-format", "text",
+                    "--system-prompt", LEROY_SYSTEM_PROMPT,
+                    "--dangerously-skip-permissions",
+                    "--no-session-persistence",
+                    "--model", "sonnet",
+                ],
+                stdin=subprocess.DEVNULL,  # prevent blocking on inherited stdin
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                cwd=WORK_DIR,
+                env={**os.environ, "CLAUDE_CODE_ENTRYPOINT": "leroy-a2a", "LEROY_TASK_ID": task_id},
+                start_new_session=True,
+            )
+            _active_pids[task_id] = proc.pid
+            logger.info("Task %s: claude PID %d", task_id, proc.pid)
+
+            # Stream stdout line by line to log file
+            stdout_lines = []
+            stderr_lines = []
+
+            sel = selectors.DefaultSelector()
+            sel.register(proc.stdout, selectors.EVENT_READ, "stdout")
+            sel.register(proc.stderr, selectors.EVENT_READ, "stderr")
+
+            deadline = time.time() + MAX_TASK_TIMEOUT
+            open_streams = 2
+
+            while open_streams > 0:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(CLAUDE_BIN, MAX_TASK_TIMEOUT)
+
+                events = sel.select(timeout=min(remaining, 5.0))
+                if not events:
+                    # No output but process might still be alive
+                    if proc.poll() is not None:
+                        # Process exited -- do a final drain with short timeout
+                        # to catch any buffered output before breaking
+                        for _ in range(10):  # up to 10 x 0.5s = 5s drain
+                            drain = sel.select(timeout=0.5)
+                            if not drain:
+                                break
+                            for dk, _ in drain:
+                                line = dk.fileobj.readline()
+                                if not line:
+                                    sel.unregister(dk.fileobj)
+                                    open_streams -= 1
+                                    continue
+                                _task_meta[task_id]["last_activity"] = datetime.now(timezone.utc).isoformat()
+                                if dk.data == "stdout":
+                                    stdout_lines.append(line)
+                                    lf.write(line)
+                                    lf.flush()
+                                else:
+                                    stderr_lines.append(line)
+                                    lf.write(f"[STDERR] {line}")
+                                    lf.flush()
+                        break
+                    continue
+
+                for key, _ in events:
+                    line = key.fileobj.readline()
+                    if not line:
+                        sel.unregister(key.fileobj)
+                        open_streams -= 1
+                        continue
+
+                    _task_meta[task_id]["last_activity"] = datetime.now(timezone.utc).isoformat()
+
+                    if key.data == "stdout":
+                        stdout_lines.append(line)
+                        lf.write(line)
+                        lf.flush()
+                    else:
+                        stderr_lines.append(line)
+                        lf.write(f"[STDERR] {line}")
+                        lf.flush()
+
+                # Bug fix: check after each event batch whether the main process
+                # has already exited. If it has, stop waiting for pipe EOF --
+                # orphaned sub-processes (spawned by claude with inherited pipe
+                # fds) would otherwise keep the loop alive indefinitely even
+                # though all real work is done.
+                if open_streams > 0 and proc.poll() is not None:
+                    # Drain remaining buffered output before stopping
+                    for _ in range(10):  # up to 10 x 0.5s = 5s drain
+                        drain = sel.select(timeout=0.5)
+                        if not drain:
+                            break
+                        for dk, _ in drain:
+                            line = dk.fileobj.readline()
+                            if not line:
+                                sel.unregister(dk.fileobj)
+                                open_streams -= 1
+                                continue
+                            _task_meta[task_id]["last_activity"] = datetime.now(timezone.utc).isoformat()
+                            if dk.data == "stdout":
+                                stdout_lines.append(line)
+                                lf.write(line)
+                                lf.flush()
+                            else:
+                                stderr_lines.append(line)
+                                lf.write(f"[STDERR] {line}")
+                                lf.flush()
+                    logger.info(
+                        "Task %s: main process exited (rc=%d) with %d pipe stream(s) still open "
+                        "(orphaned sub-process may hold pipe). Stopping reader.",
+                        task_id, proc.returncode, open_streams,
+                    )
+                    lf.write(
+                        f"\n=== Main process exited rc={proc.returncode}, "
+                        f"{open_streams} pipe stream(s) still open -- stopping reader ===\n"
+                    )
+                    lf.flush()
+                    break
+
+            sel.close()
+            # proc.wait() should return immediately: either the process already
+            # exited (normal path) or we broke out early (orphan-pipe path).
+            # 30-second safety net in case of an unexpected edge case.
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                logger.warning("Task %s: proc.wait() timed out after early loop exit -- killing", task_id)
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                except (ProcessLookupError, OSError):
+                    pass
+            stdout = "".join(stdout_lines)
+            stderr = "".join(stderr_lines)
+
+            lf.write(f"\n=== Process exited with code {proc.returncode} at {datetime.now(timezone.utc).isoformat()} ===\n")
+            lf.flush()
+
+        _active_pids.pop(task_id, None)
 
         if proc.returncode == 0:
             _task_meta[task_id]["status"] = "completed"
             _task_meta[task_id]["result"] = stdout
             logger.info("Task %s: completed (%d chars output)", task_id, len(stdout))
             _broadcast_task_update_sync(task_id)
+            result_preview = (stdout[:400] + "...") if len(stdout) > 400 else stdout
+            spec_preview = _task_meta[task_id].get("spec", "")[:120]
+            agent_bus.send({
+                "from": "leroy",
+                "to": "pm",
+                "type": "deliverable_ready",
+                "task_id": task_id,
+                "content": (
+                    f"Task {task_id} COMPLETED successfully.\n\n"
+                    f"Result preview:\n{result_preview}"
+                ),
+                "context": f"Spec preview: {spec_preview}",
+                "requires_response": False,
+            })
         else:
             _task_meta[task_id]["status"] = "failed"
             _task_meta[task_id]["result"] = (
@@ -220,9 +403,21 @@ def _run_claude_sync(task_id: str, spec: str) -> None:
             )
             logger.error("Task %s: claude exited with code %d", task_id, proc.returncode)
             _broadcast_task_update_sync(task_id)
+            agent_bus.send({
+                "from": "leroy", "to": "pm",
+                "type": "deliverable_ready",
+                "task_id": task_id,
+                "content": (
+                    f"Task {task_id} FAILED (exit code {proc.returncode}).\n\n"
+                    f"STDOUT:\n{stdout[:300]}\n"
+                    f"STDERR:\n{stderr[:300]}"
+                ),
+                "context": f"Spec preview: {_task_meta[task_id].get('spec', '')[:120]}",
+                "requires_response": False,
+            })
 
     except subprocess.TimeoutExpired:
-        # Kill the entire process group (claude + all children)
+        _active_pids.pop(task_id, None)
         if proc:
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
@@ -236,11 +431,27 @@ def _run_claude_sync(task_id: str, spec: str) -> None:
         _task_meta[task_id]["result"] = f"Task timed out after {MAX_TASK_TIMEOUT}s"
         logger.error("Task %s: timed out after %ds", task_id, MAX_TASK_TIMEOUT)
         _broadcast_task_update_sync(task_id)
+        agent_bus.send({
+            "from": "leroy", "to": "pm",
+            "type": "deliverable_ready",
+            "task_id": task_id,
+            "content": f"Task {task_id} TIMED OUT after {MAX_TASK_TIMEOUT}s.",
+            "context": f"Spec preview: {_task_meta[task_id].get('spec', '')[:120]}",
+            "requires_response": False,
+        })
     except Exception as e:
         _task_meta[task_id]["status"] = "failed"
         _task_meta[task_id]["result"] = f"Execution error: {e}"
         logger.exception("Task %s: execution error", task_id)
         _broadcast_task_update_sync(task_id)
+        agent_bus.send({
+            "from": "leroy", "to": "pm",
+            "type": "deliverable_ready",
+            "task_id": task_id,
+            "content": f"Task {task_id} FAILED with execution error: {e}",
+            "context": f"Spec preview: {_task_meta[task_id].get('spec', '')[:120]}",
+            "requires_response": False,
+        })
     finally:
         _task_meta[task_id]["completed_at"] = datetime.now(timezone.utc).isoformat()
         # Persist task outcome to Aianna -- non-blocking, handles brain unavailability
@@ -287,6 +498,11 @@ class LeroyExecutor(AgentExecutor):
         }
 
         logger.info("Task %s received (spec length: %d chars) -- launching execution", task_id, len(spec_text))
+
+        # Emit activity event for task creation
+        spec_preview = spec_text[:100].replace("\n", " ") if spec_text else ""
+        _emit_activity("leroy", "task_start", f"Task received: {spec_preview}...",
+                       task_id=task_id)
 
         # Trigger persistence queue flush on task pickup (non-blocking)
         _persist_manager.flush_if_ready()
@@ -412,12 +628,37 @@ async def tasks_complete(request: Request) -> JSONResponse:
     if task_id not in _task_meta:
         return JSONResponse({"error": f"task {task_id} not found"}, status_code=404)
 
-    _task_meta[task_id]["status"] = "completed"
+    is_qa_review = bool(body.get("qa_review", False))
+    new_status = "qa_review" if is_qa_review else "completed"
+    _task_meta[task_id]["status"] = new_status
     _task_meta[task_id]["result"] = result
     _task_meta[task_id]["completed_at"] = datetime.now(timezone.utc).isoformat()
+    if is_qa_review:
+        _task_meta[task_id]["qa_review_requested_at"] = datetime.now(timezone.utc).isoformat()
 
-    logger.info("Task %s completed", task_id)
+    logger.info("Task %s %s", task_id, "queued for qa_review" if is_qa_review else "completed")
     _broadcast_task_update_sync(task_id)
+
+    # Emit activity event
+    event_label = "qa_review" if is_qa_review else "task_complete"
+    _emit_activity("leroy", event_label,
+                   f"Task {'queued for QA review' if is_qa_review else 'completed'}: {task_id[:8]}",
+                   task_id=task_id)
+
+    # Notify PM via message broker
+    result_str = result or ""
+    result_preview = (result_str[:400] + "...") if len(result_str) > 400 else result_str
+    agent_bus.send({
+        "from": "leroy", "to": "pm",
+        "type": "deliverable_ready",
+        "task_id": task_id,
+        "content": (
+            f"Task {task_id} {'AWAITING QA REVIEW' if is_qa_review else 'COMPLETED'} successfully.\n\n"
+            f"Result preview:\n{result_preview}"
+        ),
+        "context": f"Spec preview: {_task_meta[task_id].get('spec', '')[:120]}",
+        "requires_response": False,
+    })
 
     # Persist task outcome to Aianna -- non-blocking, handles brain unavailability
     try:
@@ -529,6 +770,62 @@ async def task_archive(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok", "task_id": task_id, "archived": True})
 
 
+async def task_review(request: Request) -> JSONResponse:
+    """POST /tasks/{task_id}/review -- PM approves or rejects a QA review task.
+
+    Body: {"decision": "approved" | "rejected", "reason": "optional rejection reason"}
+    Auth: Bearer token required.
+    Validates task is in qa_review status.
+    Transitions to completed (approved) or failed (rejected).
+    Broadcasts SSE update.
+    """
+    client = _check_auth(request)
+    if client is None:
+        return JSONResponse({"error": "authorization required"}, status_code=401)
+
+    task_id = request.path_params["task_id"]
+    if task_id not in _task_meta:
+        return JSONResponse({"error": f"task {task_id} not found"}, status_code=404)
+
+    if _task_meta[task_id]["status"] != "qa_review":
+        return JSONResponse(
+            {"error": f"task {task_id} is not in qa_review status (current: {_task_meta[task_id]['status']})"},
+            status_code=409,
+        )
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+
+    decision = body.get("decision")
+    if decision not in ("approved", "rejected"):
+        return JSONResponse({"error": "decision must be 'approved' or 'rejected'"}, status_code=400)
+
+    reason = body.get("reason", "")
+    now = datetime.now(timezone.utc).isoformat()
+
+    if decision == "approved":
+        _task_meta[task_id]["status"] = "completed"
+    else:
+        _task_meta[task_id]["status"] = "failed"
+
+    _task_meta[task_id]["review_decision"] = decision
+    _task_meta[task_id]["reviewed_at"] = now
+    if reason:
+        _task_meta[task_id]["review_reason"] = reason
+
+    logger.info("Task %s review: %s by %s", task_id, decision, client.get("client_id"))
+    _broadcast_task_update_sync(task_id)
+
+    return JSONResponse({
+        "status": "ok",
+        "task_id": task_id,
+        "decision": decision,
+        "new_status": _task_meta[task_id]["status"],
+    })
+
+
 async def task_delete(request: Request) -> JSONResponse:
     """DELETE /tasks/{task_id} -- Hard delete a task (admin only, requires confirmation).
 
@@ -599,11 +896,24 @@ async def pm_messages_receive(request: Request) -> JSONResponse:
             status_code=400,
         )
 
-    message_id = broker.store_message(body)
+    # Route through generic agent bus (legacy compat: add from/to fields)
+    body.setdefault("from", "leroy")
+    body.setdefault("to", "pm")
+    msg = agent_bus.send(body)
+    message_id = msg["message_id"]
     requires_response = body["type"] in ("question", "decision_gate", "blocker")
     logger.info(
         "PM message received: type=%s task=%s message_id=%s requires_response=%s",
         body["type"], body.get("task_id"), message_id, requires_response,
+    )
+
+    # Emit activity event for PM message
+    severity = "warn" if requires_response else "info"
+    _emit_activity(
+        "leroy", "decision_requested" if requires_response else "status_update",
+        f"PM message ({body['type']}): {body.get('content', '')[:80]}",
+        task_id=body.get("task_id"),
+        severity=severity,
     )
 
     # Update task status to "waiting_for_pm" if blocking
@@ -627,11 +937,11 @@ async def pm_messages_response_poll(request: Request) -> JSONResponse:
     Returns {"status": "answered", "response": "..."} when PM has replied.
     """
     message_id = request.path_params["message_id"]
-    msg = broker.get_message(message_id)
+    msg = agent_bus.get_message(message_id)
     if msg is None:
         return JSONResponse({"error": f"message {message_id} not found"}, status_code=404)
 
-    response = broker.poll_response(message_id)
+    response = agent_bus.poll_response(message_id)
     if response is None:
         return JSONResponse({"status": "pending", "message_id": message_id})
 
@@ -663,11 +973,11 @@ async def pm_messages_respond(request: Request) -> JSONResponse:
     if not response_text:
         return JSONResponse({"error": "response field required"}, status_code=400)
 
-    msg = broker.get_message(message_id)
+    msg = agent_bus.get_message(message_id)
     if msg is None:
         return JSONResponse({"error": f"message {message_id} not found"}, status_code=404)
 
-    ok = broker.store_response(message_id, response_text)
+    ok = agent_bus.respond(message_id, "pm", response_text)
     if not ok:
         return JSONResponse({"error": "failed to store response"}, status_code=500)
 
@@ -680,6 +990,9 @@ async def pm_messages_respond(request: Request) -> JSONResponse:
             _broadcast_task_update_sync(task_id)
 
     logger.info("PM responded to message %s (task %s)", message_id, task_id)
+    _emit_activity("pm", "decision_requested",
+                   f"PM responded to {msg.get('type', 'message')} (task {(task_id or '')[:8]})",
+                   task_id=task_id, severity="info")
     return JSONResponse({"status": "ok", "message_id": message_id, "task_id": task_id})
 
 
@@ -689,7 +1002,7 @@ async def pm_messages_pending(request: Request) -> JSONResponse:
     if client is None:
         return JSONResponse({"error": "authorization required"}, status_code=401)
 
-    pending = broker.list_pending()
+    pending = agent_bus.list_messages(to="pm", pending=True)
     return JSONResponse({"messages": pending, "count": len(pending)})
 
 
@@ -700,8 +1013,172 @@ async def pm_messages_all(request: Request) -> JSONResponse:
         return JSONResponse({"error": "authorization required"}, status_code=401)
 
     limit = int(request.query_params.get("limit", "20"))
-    messages = broker.list_all(limit=limit)
+    messages = agent_bus.list_messages(to="pm", limit=limit)
     return JSONResponse({"messages": messages, "count": len(messages)})
+
+
+# ---------------------------------------------------------------------------
+# Generic Agent Message Bus endpoints
+# ---------------------------------------------------------------------------
+
+async def bus_send(request: Request) -> JSONResponse:
+    """POST /messages -- Send a message from any agent to any agent.
+
+    Body: {from, to, content, type?, task_id?, context?, requires_response?}
+    No auth -- localhost only, same as subprocess messaging.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+
+    if not body.get("from"):
+        return JSONResponse({"error": "'from' required"}, status_code=400)
+    if not body.get("to"):
+        return JSONResponse({"error": "'to' required"}, status_code=400)
+    if not body.get("content"):
+        return JSONResponse({"error": "'content' required"}, status_code=400)
+
+    msg = agent_bus.send(body)
+
+    # Emit activity event
+    severity = "warn" if msg["requires_response"] else "info"
+    _emit_activity(
+        msg["from"],
+        "message_sent",
+        f"{msg['from']} -> {msg['to']}: {msg['content'][:80]}",
+        task_id=msg.get("task_id"),
+        severity=severity,
+    )
+
+    # If blocking message linked to a task, update task status
+    if msg["requires_response"] and msg.get("task_id") and msg["task_id"] in _task_meta:
+        _task_meta[msg["task_id"]]["status"] = "waiting_for_pm"
+        _task_meta[msg["task_id"]]["waiting_on_message"] = msg["message_id"]
+        _broadcast_task_update_sync(msg["task_id"])
+
+    return JSONResponse({
+        "message_id": msg["message_id"],
+        "status": "queued",
+        "requires_response": msg["requires_response"],
+    })
+
+
+async def bus_list(request: Request) -> JSONResponse:
+    """GET /messages -- List messages with filters. Never auto-marks as read.
+
+    Query params: to, from, pending (bool), unread (bool), type, limit
+    """
+    to = request.query_params.get("to")
+    from_agent = request.query_params.get("from")
+    pending = request.query_params.get("pending", "").lower() in ("true", "1", "yes")
+    unread = request.query_params.get("unread", "").lower() in ("true", "1", "yes")
+    msg_type = request.query_params.get("type")
+    limit = int(request.query_params.get("limit", "50"))
+
+    messages = agent_bus.list_messages(
+        to=to, from_agent=from_agent, pending=pending,
+        unread=unread, msg_type=msg_type, limit=limit,
+    )
+    return JSONResponse({"messages": messages, "count": len(messages)})
+
+
+async def bus_get(request: Request) -> JSONResponse:
+    """GET /messages/{message_id} -- Get a single message."""
+    message_id = request.path_params["message_id"]
+    msg = agent_bus.get_message(message_id)
+    if msg is None:
+        return JSONResponse({"error": f"message {message_id} not found"}, status_code=404)
+    return JSONResponse(msg)
+
+
+async def bus_respond(request: Request) -> JSONResponse:
+    """POST /messages/{message_id}/respond -- Reply to a message.
+
+    Body: {from, content}
+    """
+    message_id = request.path_params["message_id"]
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+
+    responder = body.get("from", "unknown")
+    content = body.get("content", "")
+    if not content:
+        return JSONResponse({"error": "'content' required"}, status_code=400)
+
+    msg = agent_bus.get_message(message_id)
+    if msg is None:
+        return JSONResponse({"error": f"message {message_id} not found"}, status_code=404)
+
+    ok = agent_bus.respond(message_id, responder, content)
+    if not ok:
+        return JSONResponse({"error": "failed to store response"}, status_code=500)
+
+    # If task was in waiting state, restore to working
+    task_id = msg.get("task_id")
+    if task_id and task_id in _task_meta:
+        if _task_meta[task_id].get("status") == "waiting_for_pm":
+            _task_meta[task_id]["status"] = "working"
+            _task_meta[task_id].pop("waiting_on_message", None)
+            _broadcast_task_update_sync(task_id)
+
+    _emit_activity(
+        responder, "message_response",
+        f"{responder} responded to {msg.get('from', '?')}'s {msg.get('type', 'message')}",
+        task_id=task_id, severity="info",
+    )
+    return JSONResponse({"status": "ok", "message_id": message_id})
+
+
+async def bus_read(request: Request) -> JSONResponse:
+    """POST /messages/{message_id}/read -- Explicitly mark a message as read.
+
+    Body: {agent: "pm"}
+    Read is NEVER automatic on GET. Monitor daemons can poll without consuming.
+    """
+    message_id = request.path_params["message_id"]
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+
+    agent = body.get("agent", "unknown")
+    ok = agent_bus.mark_read(message_id, agent)
+    if not ok:
+        return JSONResponse({"error": f"message {message_id} not found"}, status_code=404)
+
+    return JSONResponse({"status": "ok", "message_id": message_id, "read_by": agent})
+
+
+async def bus_agents(request: Request) -> JSONResponse:
+    """GET /messages/agents -- List known agents with unread/pending counts."""
+    agents = agent_bus.agent_summary()
+    return JSONResponse({"agents": agents, "count": len(agents)})
+
+
+async def bus_poll_response(request: Request) -> JSONResponse:
+    """GET /messages/{message_id}/response -- Subprocess polls for response.
+
+    Returns immediately. No blocking. Matches the old /pm/messages/{id}/response pattern
+    so Leroy subprocesses work without changes.
+    """
+    message_id = request.path_params["message_id"]
+    msg = agent_bus.get_message(message_id)
+    if msg is None:
+        return JSONResponse({"error": f"message {message_id} not found"}, status_code=404)
+
+    response = agent_bus.poll_response(message_id)
+    if response is None:
+        return JSONResponse({"status": "pending", "message_id": message_id})
+
+    return JSONResponse({
+        "status": "answered",
+        "message_id": message_id,
+        "response": response,
+        "responded_at": msg.get("responded_at"),
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -782,7 +1259,7 @@ async def task_messages(request: Request) -> JSONResponse:
     if task_id not in _task_meta:
         return JSONResponse({"error": f"task {task_id} not found"}, status_code=404)
 
-    all_messages = broker.list_all(limit=200)
+    all_messages = agent_bus.list_messages(limit=200)
     task_msgs = [m for m in all_messages if m.get("task_id") == task_id]
     return JSONResponse({"messages": task_msgs, "count": len(task_msgs)})
 
@@ -840,6 +1317,769 @@ async def tasks_stream(request: Request) -> StreamingResponse:
 
 
 # ---------------------------------------------------------------------------
+# Stuck task detector (background thread)
+# ---------------------------------------------------------------------------
+def _stuck_task_detector() -> None:
+    """Background thread: detect tasks stuck in 'working' after all subtasks complete."""
+    logger.info("Stuck task detector running")
+    while True:
+        time.sleep(_STUCK_CHECK_INTERVAL)
+        try:
+            for task_id, meta in list(_task_meta.items()):
+                if meta.get("status") != "working":
+                    continue
+
+                # Check 1: all subtasks completed but parent still working
+                subtasks = _subtask_store.get(task_id) if _subtask_store else []
+                if subtasks and all(st.get("status") in ("completed", "failed") for st in subtasks):
+                    # Skip if we already tried to auto-complete this task
+                    if meta.get("_stuck_resolved"):
+                        continue
+                    last_subtask_time = max(
+                        (st.get("completed_at", "") for st in subtasks),
+                        default=""
+                    )
+                    if last_subtask_time:
+                        elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(last_subtask_time)).total_seconds()
+                        if elapsed > _STUCK_THRESHOLD:
+                            logger.warning(
+                                "STUCK TASK DETECTED: %s -- all %d subtasks done, parent still working for %ds. "
+                                "PID: %s, last_activity: %s",
+                                task_id, len(subtasks), int(elapsed),
+                                _active_pids.get(task_id, "none (interactive session)"),
+                                meta.get("last_activity", "unknown"),
+                            )
+                            now_iso = datetime.now(timezone.utc).isoformat()
+                            meta["_stuck_detected_at"] = now_iso
+                            meta["_stuck_reason"] = f"All {len(subtasks)} subtasks done, parent working for {int(elapsed)}s"
+
+                            # Auto-resolve: kill the stuck process (if any) and
+                            # mark the task completed. All subtasks finished
+                            # successfully -- the stall is an infrastructure bug
+                            # (e.g. orphaned pipe holder), not a work failure.
+                            pid = _active_pids.get(task_id)
+                            if pid:
+                                try:
+                                    os.killpg(os.getpgid(pid), signal.SIGTERM)
+                                    logger.info("STUCK TASK %s: sent SIGTERM to process group (PID %d)", task_id, pid)
+                                except (ProcessLookupError, OSError) as kill_err:
+                                    logger.info("STUCK TASK %s: SIGTERM skipped (%s)", task_id, kill_err)
+                                _active_pids.pop(task_id, None)
+
+                            meta["status"] = "completed"
+                            meta["completed_at"] = now_iso
+                            if not meta.get("result"):
+                                meta["result"] = (
+                                    f"[Auto-completed by stuck detector after {int(elapsed)}s. "
+                                    f"All {len(subtasks)} subtasks finished. "
+                                    f"See logs/{task_id}.log for full output.]"
+                                )
+                            _broadcast_task_update_sync(task_id)
+                            agent_bus.send({
+                                "from": "leroy", "to": "pm",
+                                "type": "deliverable_ready",
+                                "task_id": task_id,
+                                "content": (
+                                    f"Task {task_id} AUTO-COMPLETED by stuck detector. "
+                                    f"All {len(subtasks)} subtasks finished {int(elapsed)}s ago. "
+                                    f"Parent process was stuck (likely orphaned pipe). "
+                                    f"Work is done -- check logs/{task_id}.log for full output."
+                                ),
+                                "requires_response": False,
+                            })
+                            meta["_stuck_resolved"] = True
+                            logger.info("STUCK TASK %s: auto-completed successfully", task_id)
+
+                # Check 2: subprocess PID liveness (only for server-spawned tasks)
+                pid = _active_pids.get(task_id)
+                if pid:
+                    try:
+                        os.kill(pid, 0)  # signal 0 = check if alive
+                    except ProcessLookupError:
+                        logger.error(
+                            "DEAD PROCESS: task %s has PID %d but process is gone. Auto-failing.",
+                            task_id, pid
+                        )
+                        _active_pids.pop(task_id, None)
+                        meta["status"] = "failed"
+                        meta["result"] = f"Process {pid} died unexpectedly. Check logs/{task_id}.log"
+                        _broadcast_task_update_sync(task_id)
+                        agent_bus.send({
+                            "from": "leroy", "to": "pm",
+                            "type": "deliverable_ready",
+                            "task_id": task_id,
+                            "content": f"Task {task_id} FAILED -- subprocess PID {pid} died unexpectedly.",
+                            "requires_response": False,
+                        })
+        except Exception:
+            logger.exception("Stuck task detector error")
+
+
+async def task_logs(request: Request) -> JSONResponse:
+    """GET /tasks/{task_id}/logs -- Tail the task log file for Ops troubleshooting."""
+    client = _check_auth(request)
+    if client is None:
+        return JSONResponse({"error": "authorization required"}, status_code=401)
+
+    task_id = request.path_params["task_id"]
+    tail_lines = int(request.query_params.get("tail", "50"))
+    log_file = LOGS_DIR / f"{task_id}.log"
+
+    if not log_file.exists():
+        return JSONResponse({"error": "no log file for this task", "task_id": task_id}, status_code=404)
+
+    try:
+        lines = log_file.read_text().splitlines()
+        tail = lines[-tail_lines:] if len(lines) > tail_lines else lines
+        pid = _active_pids.get(task_id)
+        pid_alive = False
+        if pid:
+            try:
+                os.kill(pid, 0)
+                pid_alive = True
+            except ProcessLookupError:
+                pass
+
+        return JSONResponse({
+            "task_id": task_id,
+            "log_lines": tail,
+            "total_lines": len(lines),
+            "showing": len(tail),
+            "log_file": str(log_file),
+            "process": {"pid": pid, "alive": pid_alive} if pid else None,
+            "last_activity": _task_meta.get(task_id, {}).get("last_activity"),
+            "stuck_detected": _task_meta.get(task_id, {}).get("_stuck_detected_at"),
+        })
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# ---------------------------------------------------------------------------
+# Agent registry endpoints
+# ---------------------------------------------------------------------------
+
+# Known agents seeded at startup (Phase 1: static roster)
+_SEED_AGENTS = [
+    {
+        "name": "pm",
+        "display_name": "PM",
+        "type": "interactive",
+        "launcher": "pm.sh",
+        "status": "idle",
+        "current_task": None,
+        "last_heartbeat": None,
+        "last_activity": None,
+        "metadata": {
+            "launch_method": "manual",
+            "description": "Product Manager -- specs, decisions, delegation",
+        },
+    },
+    {
+        "name": "leroy",
+        "display_name": "Leroy",
+        "type": "daemon",
+        "launcher": "leroy.sh",
+        "status": "idle",
+        "current_task": None,
+        "last_heartbeat": None,
+        "last_activity": None,
+        "metadata": {
+            "launch_method": "launchd",
+            "description": "Engineering Lead -- executes specs via claude CLI",
+        },
+    },
+    {
+        "name": "ops",
+        "display_name": "Ops",
+        "type": "on-demand",
+        "launcher": "ops.sh",
+        "status": "idle",
+        "current_task": None,
+        "last_heartbeat": None,
+        "last_activity": None,
+        "metadata": {
+            "launch_method": "manual",
+            "description": "Infrastructure ops and troubleshooting",
+        },
+    },
+    {
+        "name": "content-agent",
+        "display_name": "Content Agent",
+        "type": "scheduled",
+        "launcher": "content.sh",
+        "status": "idle",
+        "current_task": None,
+        "last_heartbeat": None,
+        "last_activity": None,
+        "metadata": {
+            "launch_method": "launchd",
+            "schedule": "daily 6AM CST",
+            "description": "Daily content pipeline -- queries Aianna, generates drafts",
+        },
+    },
+]
+
+_HEARTBEAT_WINDOW_SECONDS = 60  # seconds per heartbeat window
+_HEARTBEAT_MISS_THRESHOLD = 3  # consecutive missed windows = unreachable
+
+
+async def agents_list(request: Request) -> JSONResponse:
+    """GET /agents -- Returns registered agent roster with status fields."""
+    agents = _agent_store.list_all()
+    # Compute unreachable status based on last_heartbeat
+    now = datetime.now(timezone.utc)
+    for agent in agents:
+        lhb = agent.get("last_heartbeat")
+        if lhb and agent.get("status") not in ("error",):
+            try:
+                lhb_dt = datetime.fromisoformat(lhb)
+                elapsed = (now - lhb_dt).total_seconds()
+                if elapsed > _HEARTBEAT_WINDOW_SECONDS * _HEARTBEAT_MISS_THRESHOLD:
+                    agent["status"] = "unreachable"
+            except Exception:
+                pass
+    return JSONResponse({"agents": agents, "count": len(agents)})
+
+
+async def agent_heartbeat(request: Request) -> JSONResponse:
+    """POST /agents/{name}/heartbeat -- Agent reports status and current task.
+
+    Body: {"status": "idle|running|error", "current_task": null|"task_id", "metadata": {}}
+    """
+    name = request.path_params["name"]
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+
+    now = datetime.now(timezone.utc).isoformat()
+    existing = _agent_store.get(name)
+    if existing is None:
+        # Auto-register unknown agents
+        existing = {
+            "name": name,
+            "display_name": name.replace("-", " ").title(),
+            "type": "on-demand",
+            "launcher": "unknown",
+            "status": "idle",
+            "current_task": None,
+            "last_heartbeat": None,
+            "last_activity": None,
+            "metadata": {},
+        }
+
+    existing["last_heartbeat"] = now
+    existing["last_activity"] = now
+    if "status" in body:
+        existing["status"] = body["status"]
+    if "current_task" in body:
+        existing["current_task"] = body.get("current_task")
+    if "metadata" in body and isinstance(body["metadata"], dict):
+        existing["metadata"].update(body["metadata"])
+
+    _agent_store.upsert(existing)
+    return JSONResponse({"status": "ok", "name": name, "updated_at": now})
+
+
+# ---------------------------------------------------------------------------
+# Activity feed endpoints
+# ---------------------------------------------------------------------------
+
+async def activity_create(request: Request) -> JSONResponse:
+    """POST /activity -- Create an activity event from an external agent/monitor.
+
+    Body: {agent, type, summary, severity?, task_id?, detail?}
+    No auth -- localhost only (monitors and sidecars).
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+
+    agent = body.get("agent")
+    event_type = body.get("type")
+    summary = body.get("summary")
+    if not all([agent, event_type, summary]):
+        return JSONResponse({"error": "agent, type, and summary required"}, status_code=400)
+
+    _emit_activity(
+        agent, event_type, summary,
+        detail=body.get("detail"),
+        task_id=body.get("task_id"),
+        severity=body.get("severity", "info"),
+    )
+    return JSONResponse({"status": "ok"})
+
+
+async def activity_list(request: Request) -> JSONResponse:
+    """GET /activity -- Returns recent activity events.
+
+    Query params:
+      ?limit=50   (default 100, max 500)
+      ?since=<iso8601>
+      ?agent=<name>
+    """
+    limit = min(int(request.query_params.get("limit", "100")), 500)
+    since = request.query_params.get("since")
+    agent_filter = request.query_params.get("agent")
+    events = _activity_store.list_recent(limit=limit, since=since, agent=agent_filter)
+    return JSONResponse({"events": events, "count": len(events)})
+
+
+async def activity_stream(request: Request) -> StreamingResponse:
+    """GET /activity/stream -- SSE stream of activity events.
+
+    Sends:
+    - Recent events snapshot on connect
+    - New events as they are emitted
+    - Heartbeat every 15 seconds
+    """
+    queue: asyncio.Queue = asyncio.Queue(maxsize=200)
+    _activity_sse_subscribers.add(queue)
+
+    # Wire activity store to push into this queue
+    def _push(evt):
+        try:
+            queue.put_nowait(json.dumps({"type": "activity_event", "event": evt}))
+        except asyncio.QueueFull:
+            _activity_sse_subscribers.discard(queue)
+
+    _activity_store.add_sse_subscriber(_push)
+
+    async def event_generator():
+        try:
+            # Send recent snapshot
+            snapshot_events = _activity_store.list_recent(limit=50)
+            snapshot = json.dumps({"type": "activity_snapshot", "events": snapshot_events})
+            yield f"data: {snapshot}\n\n"
+
+            while True:
+                try:
+                    data = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    yield f"data: {data}\n\n"
+                except asyncio.TimeoutError:
+                    heartbeat = json.dumps({
+                        "type": "heartbeat",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
+                    yield f"data: {heartbeat}\n\n"
+        except Exception:
+            pass
+        finally:
+            _activity_sse_subscribers.discard(queue)
+            _activity_store.remove_sse_subscriber(_push)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# PM Proposal approval queue endpoints
+# ---------------------------------------------------------------------------
+
+_proposal_store: task_db.ProposalStore | None = None
+
+
+async def proposals_create(request: Request) -> JSONResponse:
+    """POST /pm/proposals -- Headless PM submits a draft spec for Brad's approval.
+
+    Body: {proposal_type, title, content, reasoning, trigger_event?, trigger_task_id?}
+    No auth -- localhost only.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+
+    title = body.get("title")
+    content = body.get("content")
+    if not title or not content:
+        return JSONResponse({"error": "title and content required"}, status_code=400)
+
+    from uuid import uuid4
+    proposal = {
+        "proposal_id": uuid4().hex,
+        "status": "pending",
+        "proposal_type": body.get("proposal_type", "build_spec"),
+        "trigger_event": body.get("trigger_event"),
+        "trigger_task_id": body.get("trigger_task_id"),
+        "title": title,
+        "content": content,
+        "reasoning": body.get("reasoning", ""),
+    }
+    stored = _proposal_store.create(proposal)
+
+    _emit_activity("pm-headless", "proposal_created",
+                   f"New proposal: {title}",
+                   task_id=body.get("trigger_task_id"),
+                   severity="warn")
+
+    logger.info("Proposal created: %s -- %s", stored["proposal_id"], title)
+    return JSONResponse({"proposal_id": stored["proposal_id"], "status": "pending"})
+
+
+async def proposals_list(request: Request) -> JSONResponse:
+    """GET /pm/proposals -- List proposals, optionally filtered by status.
+
+    Query params: ?status=pending (default), ?limit=50
+    """
+    client = _check_auth(request)
+    if client is None:
+        return JSONResponse({"error": "authorization required"}, status_code=401)
+
+    status = request.query_params.get("status", "pending")
+    limit = int(request.query_params.get("limit", "50"))
+
+    if status == "all":
+        proposals = _proposal_store.list_all(limit=limit)
+    else:
+        proposals = _proposal_store.list_by_status(status=status, limit=limit)
+
+    return JSONResponse({"proposals": proposals, "count": len(proposals)})
+
+
+async def proposals_approve(request: Request) -> JSONResponse:
+    """POST /pm/proposals/{proposal_id}/approve -- Brad approves a proposal.
+
+    Body: {feedback?: "optional note"}
+    """
+    client = _check_auth(request)
+    if client is None:
+        return JSONResponse({"error": "authorization required"}, status_code=401)
+
+    proposal_id = request.path_params["proposal_id"]
+    proposal = _proposal_store.get(proposal_id)
+    if proposal is None:
+        return JSONResponse({"error": f"proposal {proposal_id} not found"}, status_code=404)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    now = datetime.now(timezone.utc).isoformat()
+    updated = _proposal_store.update(proposal_id, {
+        "status": "approved",
+        "reviewed_at": now,
+        "reviewer_feedback": body.get("feedback"),
+    })
+
+    # Notify on bus so monitor can spawn headless PM to execute
+    agent_bus.send({
+        "from": "brad",
+        "to": "pm-headless",
+        "type": "approval",
+        "content": f"Proposal approved: {proposal.get('title', '')}",
+        "task_id": proposal.get("trigger_task_id"),
+        "context": json.dumps({"proposal_id": proposal_id}),
+    })
+
+    _emit_activity("brad", "proposal_approved",
+                   f"Approved: {proposal.get('title', '')}",
+                   task_id=proposal.get("trigger_task_id"))
+
+    logger.info("Proposal %s approved", proposal_id)
+    return JSONResponse({"status": "approved", "proposal_id": proposal_id})
+
+
+async def proposals_reject(request: Request) -> JSONResponse:
+    """POST /pm/proposals/{proposal_id}/reject -- Brad rejects a proposal.
+
+    Body: {feedback: "why it was rejected"}
+    """
+    client = _check_auth(request)
+    if client is None:
+        return JSONResponse({"error": "authorization required"}, status_code=401)
+
+    proposal_id = request.path_params["proposal_id"]
+    proposal = _proposal_store.get(proposal_id)
+    if proposal is None:
+        return JSONResponse({"error": f"proposal {proposal_id} not found"}, status_code=404)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    feedback = body.get("feedback", "")
+    now = datetime.now(timezone.utc).isoformat()
+    _proposal_store.update(proposal_id, {
+        "status": "rejected",
+        "reviewed_at": now,
+        "reviewer_feedback": feedback,
+    })
+
+    _emit_activity("brad", "proposal_rejected",
+                   f"Rejected: {proposal.get('title', '')}",
+                   detail=feedback,
+                   task_id=proposal.get("trigger_task_id"))
+
+    logger.info("Proposal %s rejected: %s", proposal_id, feedback)
+    return JSONResponse({"status": "rejected", "proposal_id": proposal_id, "feedback": feedback})
+
+
+# ---------------------------------------------------------------------------
+# Specs pipeline endpoint
+# ---------------------------------------------------------------------------
+
+async def specs_list(request: Request) -> JSONResponse:
+    """GET /specs -- Returns specs with pipeline stage derived from task metadata.
+
+    Pipeline stages:
+      draft   -- specs in ~/Projects/leroy/specs/drafts/ not yet sent
+      sent    -- task status == pending
+      building -- task status == working | waiting_for_pm
+      qa      -- task status == qa_review
+      done    -- task status == completed
+      failed  -- task status == failed | cancelled
+    """
+    import re
+
+    def _extract_title(spec_text: str) -> str:
+        if not spec_text:
+            return "Untitled"
+        for line in spec_text.splitlines():
+            line = line.strip()
+            if line.startswith("# "):
+                return line[2:].strip()
+            if line.startswith("Subject:"):
+                return line[8:].strip()
+        # Fall back to first non-empty line
+        for line in spec_text.splitlines():
+            if line.strip():
+                return line.strip()[:80]
+        return "Untitled"
+
+    def _task_to_stage(status: str) -> str:
+        if status in ("pending",):
+            return "sent"
+        elif status in ("working", "waiting_for_pm"):
+            return "building"
+        elif status == "qa_review":
+            return "qa"
+        elif status == "completed":
+            return "done"
+        elif status in ("failed", "cancelled"):
+            return "failed"
+        return "sent"
+
+    specs = []
+    for task in _task_meta.values():
+        stage = _task_to_stage(task.get("status", "pending"))
+        title = _extract_title(task.get("spec", ""))
+        # Detect QA tasks by title convention
+        is_qa_task = bool(re.search(r'\bqa\b|\bquality assurance\b', title, re.IGNORECASE))
+        created_at = task.get("created_at", "")
+        completed_at = task.get("completed_at", "")
+
+        # Calculate time in stage
+        reference_time = completed_at if completed_at else created_at
+        time_in_stage_s = None
+        if reference_time:
+            try:
+                ref_dt = datetime.fromisoformat(reference_time)
+                time_in_stage_s = int((datetime.now(timezone.utc) - ref_dt).total_seconds())
+            except Exception:
+                pass
+
+        qa_pass_rate = None
+        if task.get("result"):
+            # Extract QA pass rate from result string if present
+            m = re.search(r'(\d+/\d+)\s*(?:pass|QA)', task["result"], re.IGNORECASE)
+            if m:
+                qa_pass_rate = m.group(1)
+
+        specs.append({
+            "task_id": task["task_id"],
+            "title": title,
+            "stage": stage,
+            "is_qa_task": is_qa_task,
+            "created_at": created_at,
+            "completed_at": completed_at,
+            "time_in_stage_seconds": time_in_stage_s,
+            "qa_pass_rate": qa_pass_rate,
+            "archived": task.get("archived", False),
+        })
+
+    # Sort: newest first
+    specs.sort(key=lambda s: s["created_at"] or "", reverse=True)
+
+    # Optionally include draft specs from filesystem
+    draft_dir = Path(WORK_DIR) / "specs" / "drafts"
+    if draft_dir.exists():
+        for f in sorted(draft_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)[:20]:
+            try:
+                content = f.read_text()
+                title = _extract_title(content)
+                mtime = datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc).isoformat()
+                specs.insert(0, {
+                    "task_id": None,
+                    "title": title,
+                    "stage": "draft",
+                    "is_qa_task": False,
+                    "created_at": mtime,
+                    "completed_at": None,
+                    "time_in_stage_seconds": None,
+                    "qa_pass_rate": None,
+                    "archived": False,
+                    "draft_file": f.name,
+                })
+            except Exception:
+                pass
+
+    return JSONResponse({"specs": specs, "count": len(specs)})
+
+
+# ---------------------------------------------------------------------------
+# Brain health proxy
+# ---------------------------------------------------------------------------
+
+async def brain_health(request: Request) -> JSONResponse:
+    """GET /brain/health -- Proxies to forge-brain health endpoint on Kush."""
+    brain_url = config.FORGE_BRAIN_URL.rstrip("/").replace("/mcp", "")
+    # Try health endpoint at base:8301/health first, fallback to base:8300/health
+    health_urls = [
+        brain_url.replace(":8300", ":8301") + "/health",
+        brain_url + "/health",
+    ]
+
+    for url in health_urls:
+        try:
+            req = urllib.request.Request(url, headers={"Authorization": f"Bearer {config.FORGE_BRAIN_TOKEN}"})
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                data = json.loads(resp.read().decode())
+                data["_proxy_source"] = url
+                data["_proxy_ok"] = True
+                data["circuit_breaker"] = _persist_manager.circuit_state
+                data["persist_queue_depth"] = _persist_manager.queue_depth()
+                data["dead_letter_depth"] = _persist_manager.dead_letter_depth()
+                return JSONResponse(data)
+        except urllib.error.HTTPError as e:
+            # Got a response, parse it
+            try:
+                data = json.loads(e.read().decode())
+                data["_proxy_source"] = url
+                data["_proxy_ok"] = False
+                data["_http_status"] = e.code
+                data["circuit_breaker"] = _persist_manager.circuit_state
+                return JSONResponse(data, status_code=200)
+            except Exception:
+                pass
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+    return JSONResponse({
+        "status": "unreachable",
+        "error": last_error if "last_error" in dir() else "all health URLs failed",
+        "circuit_breaker": _persist_manager.circuit_state,
+        "persist_queue_depth": _persist_manager.queue_depth(),
+        "dead_letter_depth": _persist_manager.dead_letter_depth(),
+        "_proxy_ok": False,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Infrastructure status
+# ---------------------------------------------------------------------------
+
+_INFRA_TOPOLOGY = [
+    {
+        "name": "Kush",
+        "hostname": "kush",
+        "ip": "192.168.1.100",
+        "role": "Brain Infrastructure",
+        "services": [
+            {"name": "Qdrant", "port": 6333, "path": "/healthz"},
+            {"name": "forge-brain", "port": 8300, "path": "/health"},
+            {"name": "forge-brain-health", "port": 8301, "path": "/health"},
+        ],
+    },
+    {
+        "name": "Haze",
+        "hostname": "haze",
+        "ip": "127.0.0.1",
+        "role": "Development Machine",
+        "services": [
+            {"name": "Leroy A2A", "port": 9800, "path": "/health"},
+            {"name": "Leroy Health", "port": 9801, "path": "/health"},
+            {"name": "Dashboard", "port": 5173, "path": "/"},
+        ],
+    },
+    {
+        "name": "APEX",
+        "hostname": "apex",
+        "ip": "155.138.199.82",
+        "role": "Carric Infrastructure (CloudRaider)",
+        "services": [
+            {"name": "A2A Gateway", "port": 8443, "path": "/health"},
+        ],
+    },
+]
+
+
+def _ping_service(ip: str, port: int, path: str, timeout: float = 2.0) -> dict:
+    """Attempt an HTTP GET to ip:port/path. Returns status dict."""
+    url = f"http://{ip}:{port}{path}"
+    start = time.time()
+    try:
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            elapsed_ms = int((time.time() - start) * 1000)
+            return {"status": "up", "http_status": resp.status, "latency_ms": elapsed_ms}
+    except urllib.error.HTTPError as e:
+        elapsed_ms = int((time.time() - start) * 1000)
+        # Got response, even if error -- service is up
+        return {"status": "up", "http_status": e.code, "latency_ms": elapsed_ms}
+    except Exception as e:
+        elapsed_ms = int((time.time() - start) * 1000)
+        return {"status": "down", "error": str(e)[:80], "latency_ms": elapsed_ms}
+
+
+async def infra_status(request: Request) -> JSONResponse:
+    """GET /infra/status -- Returns infrastructure status with health pings."""
+    now = datetime.now(timezone.utc).isoformat()
+    loop = asyncio.get_event_loop()
+    result = []
+
+    for machine in _INFRA_TOPOLOGY:
+        service_results = []
+        machine_up = False
+
+        for svc in machine["services"]:
+            # Run blocking ping in thread pool to avoid blocking event loop
+            svc_status = await loop.run_in_executor(
+                None, _ping_service, machine["ip"], svc["port"], svc["path"]
+            )
+            service_results.append({
+                "name": svc["name"],
+                "port": svc["port"],
+                **svc_status,
+            })
+            if svc_status["status"] == "up":
+                machine_up = True
+
+        result.append({
+            "name": machine["name"],
+            "hostname": machine["hostname"],
+            "ip": machine["ip"],
+            "role": machine["role"],
+            "status": "up" if machine_up else "down",
+            "services": service_results,
+            "checked_at": now,
+        })
+
+    return JSONResponse({"machines": result, "checked_at": now})
+
+
+# ---------------------------------------------------------------------------
 # Health server (separate port)
 # ---------------------------------------------------------------------------
 async def health(request: Request) -> JSONResponse:
@@ -859,11 +2099,10 @@ async def health(request: Request) -> JSONResponse:
             "failed": sum(1 for t in _task_meta.values() if t["status"] == "failed"),
             "cancelled": sum(1 for t in _task_meta.values() if t["status"] == "cancelled"),
         },
-        "pm_messages": {
-            "pending_pm_response": broker.pending_count(),
-            # pm_webhook_registered now validates PID alive + HTTP reachable,
-            # not just "file exists". Eliminates stale-registry false positives.
-            "pm_webhook_registered": broker.pm_webhook_registered(),
+        "messages": {
+            "total_pending": agent_bus.pending_count(),
+            "agents": {a["name"]: {"unread": a["unread_count"], "pending": a["pending_response_count"]}
+                       for a in agent_bus.agent_summary()},
         },
         "persistence": {
             "queue_depth": _persist_manager.queue_depth(),
@@ -873,7 +2112,22 @@ async def health(request: Request) -> JSONResponse:
             "recent_log": _persist_manager.recent_log(5),
         },
         "auth_enabled": auth.is_auth_enabled(),
+        "observability": {
+            "active_pids": {tid: pid for tid, pid in _active_pids.items()},
+            "stuck_tasks": [
+                {"task_id": tid, "detected_at": meta.get("_stuck_detected_at"), "reason": meta.get("_stuck_reason")}
+                for tid, meta in _task_meta.items()
+                if meta.get("_stuck_detected_at") and meta.get("status") == "working"
+            ],
+            "logs_dir": str(LOGS_DIR),
+        },
     })
+
+async def admin_circuit_reset(request: Request) -> JSONResponse:
+    """POST /admin/circuit-reset -- Force-reset the persistence circuit breaker."""
+    result = _persist_manager.reset_circuit()
+    return JSONResponse(result)
+
 
 health_app = Starlette(routes=[Route("/health", health)])
 
@@ -907,18 +2161,48 @@ def build_app():
         Route("/tasks/{task_id}/accept", task_accept, methods=["POST"]),
         Route("/tasks/{task_id}/cancel", task_cancel, methods=["POST"]),
         Route("/tasks/{task_id}/archive", task_archive, methods=["POST"]),
+        Route("/tasks/{task_id}/review", task_review, methods=["POST"]),
         Route("/tasks/{task_id}", task_delete, methods=["DELETE"]),
+        Route("/tasks/{task_id}/logs", task_logs, methods=["GET"]),
         Route("/tasks/{task_id}/subtasks", subtask_list, methods=["GET"]),
         Route("/tasks/{task_id}/subtasks", subtask_update, methods=["POST"]),
         Route("/tasks/{task_id}/messages", task_messages, methods=["GET"]),
         Route("/tasks/{task_id}", task_detail, methods=["GET"]),
         Route("/tasks", tasks_list, methods=["GET"]),
-        # PM <-> Leroy bidirectional messaging
+        # Generic agent message bus
+        Route("/messages/agents", bus_agents, methods=["GET"]),
+        Route("/messages/{message_id}/respond", bus_respond, methods=["POST"]),
+        Route("/messages/{message_id}/read", bus_read, methods=["POST"]),
+        Route("/messages/{message_id}/response", bus_poll_response, methods=["GET"]),
+        Route("/messages/{message_id}", bus_get, methods=["GET"]),
+        Route("/messages", bus_send, methods=["POST"]),
+        Route("/messages", bus_list, methods=["GET"]),
+        # Legacy PM endpoints (backward compat -- Leroy subprocesses still use these)
         Route("/pm/messages/pending", pm_messages_pending, methods=["GET"]),
         Route("/pm/messages/{message_id}/respond", pm_messages_respond, methods=["POST"]),
         Route("/pm/messages/{message_id}/response", pm_messages_response_poll, methods=["GET"]),
         Route("/pm/messages", pm_messages_receive, methods=["POST"]),
         Route("/pm/messages", pm_messages_all, methods=["GET"]),
+        # Agent registry
+        Route("/agents", agents_list, methods=["GET"]),
+        Route("/agents/{name}/heartbeat", agent_heartbeat, methods=["POST"]),
+        # Activity feed
+        Route("/activity/stream", activity_stream, methods=["GET"]),
+        Route("/activity", activity_list, methods=["GET"]),
+        Route("/activity", activity_create, methods=["POST"]),
+        # PM Proposals (headless PM approval queue)
+        Route("/pm/proposals/{proposal_id}/approve", proposals_approve, methods=["POST"]),
+        Route("/pm/proposals/{proposal_id}/reject", proposals_reject, methods=["POST"]),
+        Route("/pm/proposals", proposals_create, methods=["POST"]),
+        Route("/pm/proposals", proposals_list, methods=["GET"]),
+        # Specs pipeline
+        Route("/specs", specs_list, methods=["GET"]),
+        # Brain health proxy
+        Route("/brain/health", brain_health, methods=["GET"]),
+        # Infrastructure status
+        Route("/infra/status", infra_status, methods=["GET"]),
+        # Admin
+        Route("/admin/circuit-reset", admin_circuit_reset, methods=["POST"]),
     ]
 
     # Prepend custom routes before A2A routes
@@ -933,7 +2217,7 @@ def build_app():
 # ---------------------------------------------------------------------------
 def main():
     """Start Leroy A2A server + health server."""
-    global _task_meta, _subtask_store
+    global _task_meta, _subtask_store, _agent_store, _activity_store, _proposal_store
 
     auth.load_tokens()
 
@@ -942,6 +2226,10 @@ def main():
     _task_meta = task_db.task_meta
     _subtask_store = task_db.subtask_store
     broker.init_store(task_db.msg_store)
+    agent_bus.init(task_db.msg_store, task_db.agent_store)
+    _agent_store = task_db.agent_store
+    _activity_store = task_db.activity_store
+    _proposal_store = task_db.proposal_store
     logger.info(
         "Task store loaded: %d task(s), %d subtask group(s), %d message(s)",
         len(_task_meta),
@@ -949,11 +2237,27 @@ def main():
         len(task_db.msg_store._messages),
     )
 
+    # Seed known agents (Phase 1 -- no heartbeat integration yet)
+    now = datetime.now(timezone.utc).isoformat()
+    for seed in _SEED_AGENTS:
+        existing = _agent_store.get(seed["name"])
+        if existing is None:
+            # Only seed if not already registered (preserves heartbeat data on restart)
+            agent_record = dict(seed)
+            agent_record["seeded_at"] = now
+            _agent_store.upsert(agent_record)
+            logger.info("Seeded agent: %s", seed["name"])
+        else:
+            logger.info("Agent %s already registered, skipping seed", seed["name"])
+
+    # Emit startup activity event
+    _emit_activity("leroy", "status_update", "Leroy A2A server started",
+                   detail=f"Port {config.PORT}, {len(_task_meta)} task(s) loaded")
+
     # Start persistence manager (background retry thread + startup queue flush)
     _persist_manager.start()
 
-    # Start message broker flush thread (retries unforwarded messages when PM comes online)
-    broker.start_flush_thread()
+    # Legacy broker flush thread removed -- webhook is dead, agent_bus handles messaging
 
     app = build_app()
 
@@ -975,6 +2279,11 @@ def main():
 
     health_thread = threading.Thread(target=run_health, daemon=True)
     health_thread.start()
+
+    # Start stuck task detector
+    stuck_thread = threading.Thread(target=_stuck_task_detector, daemon=True)
+    stuck_thread.start()
+    logger.info("Stuck task detector started (check every %ds, threshold %ds)", _STUCK_CHECK_INTERVAL, _STUCK_THRESHOLD)
 
     # Run main A2A server
     uvicorn.run(

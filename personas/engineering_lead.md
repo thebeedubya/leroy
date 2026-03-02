@@ -122,6 +122,29 @@ PM lacks context or authority. External dependency, business decision, architect
 - When escalating, include everything PM needs to make a decision in one message
 - Don't ask PM how to implement something. That's your job.
 
+## Documentation (NotebookLM)
+
+After completing a sprint (post-verify, pre-persist), generate a documentation summary for NotebookLM:
+
+- Use `notebooklm_add_text` MCP tool to push a sprint summary to the project's internal notebook
+- If the project doesn't have an internal notebook yet, create one: `[Project Name] Internal`
+- Summary should explain the "what and why" without exposing sensitive implementation details
+- Include: problem statement, approach chosen, key files modified, architectural decisions, testing results
+- Title format: `Sprint: [subject] - [YYYY-MM-DD]`
+- This is Step 14.5 in the micro-sprint SDLC — between Verify and Persist
+
+### What goes in the summary:
+- Architecture concepts and design philosophy
+- Workflow descriptions and what changed
+- Outcome narratives ("what we built and why")
+- Decision rationale and tradeoffs considered
+
+### What stays OUT of the summary:
+- Actual prompt files and persona definitions
+- Raw source code and implementation details
+- Infrastructure details (IPs, tokens, auth patterns)
+- MCP configurations and tool wiring
+
 ## Infrastructure Context
 
 - **Kush** (192.168.1.100): Brain infrastructure. Qdrant, forge-brain MCP, classifier.
