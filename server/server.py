@@ -1413,6 +1413,7 @@ def _stuck_task_detector() -> None:
                                 ),
                                 "requires_response": False,
                             })
+                            _broadcast_task_update_sync(task_id)
                             logger.info("STUCK TASK %s: auto-completed successfully", task_id)
 
                 # Check 2: subprocess PID liveness (only for server-spawned tasks)
