@@ -47,6 +47,9 @@ import persist_manager as pm
 import message_broker as broker  # legacy, kept for backward compat during migration
 import agent_bus
 import task_db
+from state_machine import TaskStateMachine, TaskState, IllegalTransitionError
+from failure_taxonomy import classify_failure, FailureCategory, is_infra_failure, INFRA_CATEGORIES
+from retry_budget import RetryBudget
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -78,6 +81,10 @@ _subtask_store: task_db.PersistentSubtaskStore | None = None  # set in main()
 # Agent registry and activity event store -- set in main()
 _agent_store: task_db.AgentStore | None = None
 _activity_store: task_db.ActivityStore | None = None
+
+# v2 State machine + retry budget -- set in main()
+_state_machine: TaskStateMachine | None = None
+_retry_budget: RetryBudget | None = None
 
 # SSE subscribers: set of asyncio.Queue instances for broadcasting task updates
 _sse_subscribers: set = set()
@@ -230,7 +237,15 @@ def _run_claude_sync(task_id: str, spec: str) -> None:
     """Run claude -p in a subprocess with real-time log streaming."""
     log_file = LOGS_DIR / f"{task_id}.log"
     logger.info("Task %s: spawning claude -p (timeout=%ds, log=%s)", task_id, MAX_TASK_TIMEOUT, log_file)
-    _task_meta[task_id]["status"] = "working"
+    # v2: transition NEW -> RUNNING
+    if _state_machine:
+        try:
+            _state_machine.transition(task_id, TaskState.RUNNING, reason="builder_launched")
+        except (IllegalTransitionError, KeyError) as e:
+            logger.warning("v2 transition to RUNNING failed for %s: %s", task_id, e)
+            _task_meta[task_id]["status"] = "working"
+    else:
+        _task_meta[task_id]["status"] = "working"
     _task_meta[task_id]["log_file"] = str(log_file)
     _task_meta[task_id]["last_activity"] = datetime.now(timezone.utc).isoformat()
     _broadcast_task_update_sync(task_id)
@@ -385,7 +400,15 @@ def _run_claude_sync(task_id: str, spec: str) -> None:
         _active_pids.pop(task_id, None)
 
         if proc.returncode == 0:
-            _task_meta[task_id]["status"] = "completed"
+            # v2: transition RUNNING -> COMPLETED_UNVERIFIED
+            if _state_machine:
+                try:
+                    _state_machine.transition(task_id, TaskState.COMPLETED_UNVERIFIED, reason="builder_exit_0")
+                except (IllegalTransitionError, KeyError) as e:
+                    logger.warning("v2 transition to COMPLETED_UNVERIFIED failed: %s", e)
+                    _task_meta[task_id]["status"] = "completed"
+            else:
+                _task_meta[task_id]["status"] = "completed"
             _task_meta[task_id]["result"] = stdout
             logger.info("Task %s: completed (%d chars output)", task_id, len(stdout))
             _broadcast_task_update_sync(task_id)
@@ -404,12 +427,24 @@ def _run_claude_sync(task_id: str, spec: str) -> None:
                 "requires_response": False,
             })
         else:
-            _task_meta[task_id]["status"] = "failed"
-            _task_meta[task_id]["result"] = (
-                f"Exit code {proc.returncode}\n"
-                f"STDOUT:\n{stdout}\n"
-                f"STDERR:\n{stderr}"
-            )
+            result_text = f"Exit code {proc.returncode}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+            # v2: classify failure and transition
+            if _state_machine and _retry_budget:
+                try:
+                    categories = classify_failure(result_text, _task_meta.get(task_id, {}))
+                    _task_meta[task_id]["failure_categories"] = [c.value for c in categories]
+                    _state_machine.transition(task_id, TaskState.FAILED_RETRYABLE,
+                                              reason=f"exit_{proc.returncode}: {','.join(c.value for c in categories)}")
+                    remaining = _retry_budget.consume_retry(task_id, categories)
+                    if remaining <= 0 and not is_infra_failure(categories):
+                        _state_machine.transition(task_id, TaskState.ESCALATED,
+                                                  reason="retry_budget_exhausted")
+                except (IllegalTransitionError, KeyError) as e:
+                    logger.warning("v2 failure handling error: %s", e)
+                    _task_meta[task_id]["status"] = "failed"
+            else:
+                _task_meta[task_id]["status"] = "failed"
+            _task_meta[task_id]["result"] = result_text
             logger.error("Task %s: claude exited with code %d", task_id, proc.returncode)
             _broadcast_task_update_sync(task_id)
             agent_bus.send({
@@ -436,8 +471,24 @@ def _run_claude_sync(task_id: str, spec: str) -> None:
                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-        _task_meta[task_id]["status"] = "failed"
-        _task_meta[task_id]["result"] = f"Task timed out after {MAX_TASK_TIMEOUT}s"
+        timeout_result = f"Task timed out after {MAX_TASK_TIMEOUT}s"
+        # v2: classify timeout and transition
+        if _state_machine and _retry_budget:
+            try:
+                categories = classify_failure(timeout_result, {**(_task_meta.get(task_id) or {}), "timeout": True})
+                _task_meta[task_id]["failure_categories"] = [c.value for c in categories]
+                _state_machine.transition(task_id, TaskState.FAILED_RETRYABLE,
+                                          reason=f"timeout_{MAX_TASK_TIMEOUT}s")
+                remaining = _retry_budget.consume_retry(task_id, categories)
+                if remaining <= 0:
+                    _state_machine.transition(task_id, TaskState.ESCALATED,
+                                              reason="retry_budget_exhausted_after_timeout")
+            except (IllegalTransitionError, KeyError) as e:
+                logger.warning("v2 timeout handling error: %s", e)
+                _task_meta[task_id]["status"] = "failed"
+        else:
+            _task_meta[task_id]["status"] = "failed"
+        _task_meta[task_id]["result"] = timeout_result
         logger.error("Task %s: timed out after %ds", task_id, MAX_TASK_TIMEOUT)
         _broadcast_task_update_sync(task_id)
         agent_bus.send({
@@ -449,7 +500,18 @@ def _run_claude_sync(task_id: str, spec: str) -> None:
             "requires_response": False,
         })
     except Exception as e:
-        _task_meta[task_id]["status"] = "failed"
+        # v2: classify execution error
+        if _state_machine:
+            try:
+                categories = classify_failure(str(e), _task_meta.get(task_id) or {})
+                _task_meta[task_id]["failure_categories"] = [c.value for c in categories]
+                _state_machine.transition(task_id, TaskState.FAILED_RETRYABLE,
+                                          reason=f"execution_error: {e}")
+            except (IllegalTransitionError, KeyError) as e2:
+                logger.warning("v2 exception handling error: %s", e2)
+                _task_meta[task_id]["status"] = "failed"
+        else:
+            _task_meta[task_id]["status"] = "failed"
         _task_meta[task_id]["result"] = f"Execution error: {e}"
         logger.exception("Task %s: execution error", task_id)
         _broadcast_task_update_sync(task_id)
@@ -505,6 +567,13 @@ class LeroyExecutor(AgentExecutor):
             "created_at": datetime.now(timezone.utc).isoformat(),
             "completed_at": None,
         }
+
+        # v2: Initialize state machine for this task
+        if _state_machine:
+            try:
+                _state_machine.initialize_task(task_id)
+            except Exception as e:
+                logger.warning("v2 state machine init failed for %s: %s", task_id, e)
 
         logger.info("Task %s received (spec length: %d chars) -- launching execution", task_id, len(spec_text))
 
@@ -2573,7 +2642,7 @@ def build_app():
 # ---------------------------------------------------------------------------
 def main():
     """Start Leroy A2A server + health server."""
-    global _task_meta, _subtask_store, _agent_store, _activity_store, _proposal_store
+    global _task_meta, _subtask_store, _agent_store, _activity_store, _proposal_store, _state_machine, _retry_budget
 
     auth.load_tokens()
 
@@ -2586,6 +2655,12 @@ def main():
     _agent_store = task_db.agent_store
     _activity_store = task_db.activity_store
     _proposal_store = task_db.proposal_store
+
+    # v2 State machine + retry budget
+    _state_machine = TaskStateMachine(_task_meta)
+    _retry_budget = RetryBudget(_task_meta)
+    logger.info("v2 state machine and retry budget initialized")
+
     logger.info(
         "Task store loaded: %d task(s), %d subtask group(s), %d message(s)",
         len(_task_meta),
