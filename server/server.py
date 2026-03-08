@@ -173,6 +173,12 @@ _STUCK_CHECK_INTERVAL = 60  # seconds between checks
 _STUCK_THRESHOLD = 120  # seconds after all subtasks done before flagging as stuck
 _active_pids: dict[str, int] = {}  # task_id -> subprocess PID for liveness checks
 
+# v2 Phase 1: Graduated timeout thresholds (replace flat inactivity timeout)
+_GRADUATED_GRACE_MINUTES = 5     # 0-5 min: no warnings
+_GRADUATED_WARN_MINUTES = 15     # 5-15 min: warn in metadata + SSE
+_GRADUATED_KILL_MINUTES = 30     # 15-30 min: kill with partial capture
+_PARTIAL_SNAPSHOT_INTERVAL = 60  # seconds between partial output snapshots
+
 # System prompt injected into every claude -p invocation
 LEROY_SYSTEM_PROMPT = """You are Leroy, the Engineering Lead for the FORGE ecosystem.
 You receive specs from PM and execute them. You have full tool access.
@@ -182,6 +188,22 @@ Execute the spec completely. Return a structured result with:
 - Success criteria pass/fail
 - Any issues encountered
 Be thorough but concise. No filler.
+
+BUILDER OUTPUT DISCIPLINE:
+1. Before producing any deliverable, output three sections:
+   [WHAT] Restate the task criteria in your own words.
+   [REASONING] Explain your approach, assumptions, and tradeoffs.
+   [OUTPUT] Then produce the actual deliverable.
+
+2. Every 60 seconds of work, output: [PROGRESS] Working on: {current step}
+   This resets the inactivity timer. Silence kills your session.
+
+3. If blocked on something outside your control (service down, missing credentials,
+   missing file), output: [BLOCKED] {description of what you need}
+   This notifies the PM immediately.
+
+4. Do not claim completion unless ALL criteria in the spec are addressed.
+   If you cannot complete a criterion, explicitly state which ones and why.
 
 When you need to communicate with PM during task execution, use the agent message bus:
 
@@ -233,10 +255,76 @@ Sub-task reporting: When you decompose work into sub-tasks and delegate to speci
   Use status "failed" if the subtask fails."""
 
 
+def _setup_worktree(task_id: str) -> tuple[str | None, str | None]:
+    """Create a git worktree for builder isolation. Returns (worktree_path, branch_name) or (None, None)."""
+    branch_name = f"task/{task_id[:8]}"
+    worktree_path = os.path.join(WORK_DIR, ".claude", "worktrees", task_id)
+    try:
+        os.makedirs(os.path.dirname(worktree_path), exist_ok=True)
+        subprocess.run(
+            ["git", "worktree", "add", "-b", branch_name, worktree_path],
+            cwd=WORK_DIR, check=True, capture_output=True, text=True, timeout=30,
+        )
+        logger.info("Task %s: worktree created at %s (branch %s)", task_id, worktree_path, branch_name)
+        return worktree_path, branch_name
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
+        logger.warning("Task %s: worktree creation failed (%s), falling back to project root", task_id, e)
+        return None, None
+
+
+def _cleanup_worktree(task_id: str, worktree_path: str | None, success: bool) -> None:
+    """Clean up worktree after task. On success: preserve for review. On failure: remove."""
+    if not worktree_path:
+        return
+    if success:
+        logger.info("Task %s: preserving worktree at %s for review", task_id, worktree_path)
+        return
+    try:
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", worktree_path],
+            cwd=WORK_DIR, capture_output=True, text=True, timeout=30,
+        )
+        logger.info("Task %s: worktree cleaned up", task_id)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
+        logger.warning("Task %s: worktree cleanup failed: %s", task_id, e)
+
+
+def _parse_token_usage(output: str) -> dict | None:
+    """Parse token usage from claude -p output. Returns {input, output, estimated_cost_usd} or None."""
+    import re
+    input_match = re.search(r"Input tokens:\s*([\d,]+)", output)
+    output_match = re.search(r"Output tokens:\s*([\d,]+)", output)
+    if input_match and output_match:
+        input_tokens = int(input_match.group(1).replace(",", ""))
+        output_tokens = int(output_match.group(1).replace(",", ""))
+        # Sonnet pricing: $3/MTok input, $15/MTok output
+        cost = (input_tokens * 3 + output_tokens * 15) / 1_000_000
+        return {"input": input_tokens, "output": output_tokens, "estimated_cost_usd": round(cost, 4)}
+    return None
+
+
+def _get_graduated_timeout(task_id: str) -> int:
+    """Get the kill timeout in seconds. Spec override > graduated default."""
+    meta = _task_meta.get(task_id) or {}
+    override = meta.get("inactivity_timeout")
+    if override is not None:
+        try:
+            return int(override) * 60  # override is in minutes
+        except (ValueError, TypeError):
+            pass
+    return _GRADUATED_KILL_MINUTES * 60
+
+
 def _run_claude_sync(task_id: str, spec: str) -> None:
-    """Run claude -p in a subprocess with real-time log streaming."""
+    """Run claude -p in a subprocess with real-time log streaming.
+
+    v2 Phase 1: partial output snapshots, [PROGRESS]/[BLOCKED] heartbeat parsing,
+    graduated inactivity timeout, git worktree isolation, FD cleanup, token capture.
+    """
     log_file = LOGS_DIR / f"{task_id}.log"
-    logger.info("Task %s: spawning claude -p (timeout=%ds, log=%s)", task_id, MAX_TASK_TIMEOUT, log_file)
+    kill_timeout = _get_graduated_timeout(task_id)
+    logger.info("Task %s: spawning claude -p (kill_timeout=%ds, log=%s)", task_id, kill_timeout, log_file)
+
     # v2: transition NEW -> RUNNING
     if _state_machine:
         try:
@@ -250,14 +338,24 @@ def _run_claude_sync(task_id: str, spec: str) -> None:
     _task_meta[task_id]["last_activity"] = datetime.now(timezone.utc).isoformat()
     _broadcast_task_update_sync(task_id)
 
+    # v2 Phase 1: worktree isolation
+    worktree_path, branch_name = _setup_worktree(task_id)
+    cwd = worktree_path or WORK_DIR
+    if worktree_path:
+        _task_meta[task_id]["worktree_path"] = worktree_path
+        _task_meta[task_id]["worktree_branch"] = branch_name
+
     proc = None
+    task_success = False
     try:
         with open(log_file, "w") as lf:
             lf.write(f"=== Task {task_id} started at {datetime.now(timezone.utc).isoformat()} ===\n")
-            lf.write(f"=== Spec length: {len(spec)} chars ===\n\n")
+            lf.write(f"=== Spec length: {len(spec)} chars ===\n")
+            if worktree_path:
+                lf.write(f"=== Worktree: {worktree_path} (branch: {branch_name}) ===\n")
+            lf.write("\n")
             lf.flush()
 
-            # Start in a new process group so we can kill the whole tree on timeout
             proc = subprocess.Popen(
                 [
                     CLAUDE_BIN,
@@ -267,21 +365,30 @@ def _run_claude_sync(task_id: str, spec: str) -> None:
                     "--dangerously-skip-permissions",
                     "--no-session-persistence",
                     "--model", "sonnet",
+                    "--setting-sources", "user",
                 ],
-                stdin=subprocess.DEVNULL,  # prevent blocking on inherited stdin
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                cwd=WORK_DIR,
-                env={k: v for k, v in os.environ.items() if k != "CLAUDECODE"} | {"CLAUDE_CODE_ENTRYPOINT": "leroy-a2a", "LEROY_TASK_ID": task_id},
+                cwd=cwd,
+                env={k: v for k, v in os.environ.items() if k != "CLAUDECODE"} | {
+                    "CLAUDE_CODE_ENTRYPOINT": "leroy-a2a",
+                    "LEROY_TASK_ID": task_id,
+                    "ENABLE_TOOL_SEARCH": "true",
+                },
                 start_new_session=True,
             )
             _active_pids[task_id] = proc.pid
-            logger.info("Task %s: claude PID %d", task_id, proc.pid)
+            logger.info("Task %s: claude PID %d (cwd=%s)", task_id, proc.pid, cwd)
 
-            # Stream stdout line by line to log file
             stdout_lines = []
             stderr_lines = []
+            last_snapshot_time = time.time()
+            last_activity_time = time.time()
+            task_start_time = time.time()
+            warned_inactivity = False
+            builder_sections: dict[str, str] = {}  # WHAT, REASONING, OUTPUT
 
             sel = selectors.DefaultSelector()
             sel.register(proc.stdout, selectors.EVENT_READ, "stdout")
@@ -296,12 +403,39 @@ def _run_claude_sync(task_id: str, spec: str) -> None:
                     raise subprocess.TimeoutExpired(CLAUDE_BIN, MAX_TASK_TIMEOUT)
 
                 events = sel.select(timeout=min(remaining, 5.0))
+
+                now = time.time()
+
+                # v2 Phase 1: partial output snapshot every 60s
+                if now - last_snapshot_time >= _PARTIAL_SNAPSHOT_INTERVAL:
+                    partial = "".join(stdout_lines)
+                    if partial:
+                        _task_meta[task_id]["partial_result"] = partial[-10000:]  # last 10k chars
+                    last_snapshot_time = now
+
+                # v2 Phase 1: graduated inactivity timeout
+                inactivity = now - last_activity_time
+                elapsed_minutes = (now - task_start_time) / 60
+
+                if elapsed_minutes > _GRADUATED_GRACE_MINUTES:
+                    if inactivity > kill_timeout:
+                        # Kill with partial capture
+                        logger.warning(
+                            "Task %s: inactivity timeout (%ds since last output, %d min elapsed)",
+                            task_id, int(inactivity), int(elapsed_minutes),
+                        )
+                        raise subprocess.TimeoutExpired(CLAUDE_BIN, int(inactivity))
+
+                    if not warned_inactivity and inactivity > _GRADUATED_WARN_MINUTES * 60:
+                        warned_inactivity = True
+                        _task_meta[task_id]["inactivity_warning"] = datetime.now(timezone.utc).isoformat()
+                        _broadcast_task_update_sync(task_id)
+                        logger.warning("Task %s: inactivity warning at %d min", task_id, int(inactivity / 60))
+
                 if not events:
-                    # No output but process might still be alive
                     if proc.poll() is not None:
-                        # Process exited -- do a final drain with short timeout
-                        # to catch any buffered output before breaking
-                        for _ in range(10):  # up to 10 x 0.5s = 5s drain
+                        # Process exited -- drain remaining output
+                        for _ in range(10):
                             drain = sel.select(timeout=0.5)
                             if not drain:
                                 break
@@ -311,6 +445,7 @@ def _run_claude_sync(task_id: str, spec: str) -> None:
                                     sel.unregister(dk.fileobj)
                                     open_streams -= 1
                                     continue
+                                last_activity_time = time.time()
                                 _task_meta[task_id]["last_activity"] = datetime.now(timezone.utc).isoformat()
                                 if dk.data == "stdout":
                                     stdout_lines.append(line)
@@ -330,25 +465,48 @@ def _run_claude_sync(task_id: str, spec: str) -> None:
                         open_streams -= 1
                         continue
 
+                    last_activity_time = time.time()
+                    warned_inactivity = False  # reset warning on activity
                     _task_meta[task_id]["last_activity"] = datetime.now(timezone.utc).isoformat()
 
                     if key.data == "stdout":
                         stdout_lines.append(line)
                         lf.write(line)
                         lf.flush()
+
+                        # v2 Phase 1: parse heartbeat markers
+                        stripped = line.strip()
+                        if stripped.startswith("[PROGRESS]"):
+                            progress_msg = stripped[len("[PROGRESS]"):].strip()
+                            _task_meta[task_id]["last_progress"] = progress_msg
+                            _task_meta[task_id]["last_progress_at"] = datetime.now(timezone.utc).isoformat()
+                            logger.debug("Task %s: [PROGRESS] %s", task_id, progress_msg)
+
+                        elif stripped.startswith("[BLOCKED]"):
+                            block_msg = stripped[len("[BLOCKED]"):].strip()
+                            _task_meta[task_id]["blocked_reason"] = block_msg
+                            logger.warning("Task %s: [BLOCKED] %s", task_id, block_msg)
+                            if _state_machine:
+                                try:
+                                    _state_machine.transition(task_id, TaskState.BLOCKED,
+                                                              reason=f"builder_blocked: {block_msg}")
+                                except (IllegalTransitionError, KeyError) as e:
+                                    logger.warning("v2 BLOCKED transition failed: %s", e)
+
+                        elif stripped.startswith("[WHAT]"):
+                            builder_sections["what"] = stripped[len("[WHAT]"):].strip()
+                        elif stripped.startswith("[REASONING]"):
+                            builder_sections["reasoning"] = stripped[len("[REASONING]"):].strip()
+                        elif stripped.startswith("[OUTPUT]"):
+                            builder_sections["output"] = stripped[len("[OUTPUT]"):].strip()
                     else:
                         stderr_lines.append(line)
                         lf.write(f"[STDERR] {line}")
                         lf.flush()
 
-                # Bug fix: check after each event batch whether the main process
-                # has already exited. If it has, stop waiting for pipe EOF --
-                # orphaned sub-processes (spawned by claude with inherited pipe
-                # fds) would otherwise keep the loop alive indefinitely even
-                # though all real work is done.
+                # Check if main process exited (orphan pipe guard)
                 if open_streams > 0 and proc.poll() is not None:
-                    # Drain remaining buffered output before stopping
-                    for _ in range(10):  # up to 10 x 0.5s = 5s drain
+                    for _ in range(10):
                         drain = sel.select(timeout=0.5)
                         if not drain:
                             break
@@ -358,6 +516,7 @@ def _run_claude_sync(task_id: str, spec: str) -> None:
                                 sel.unregister(dk.fileobj)
                                 open_streams -= 1
                                 continue
+                            last_activity_time = time.time()
                             _task_meta[task_id]["last_activity"] = datetime.now(timezone.utc).isoformat()
                             if dk.data == "stdout":
                                 stdout_lines.append(line)
@@ -368,8 +527,7 @@ def _run_claude_sync(task_id: str, spec: str) -> None:
                                 lf.write(f"[STDERR] {line}")
                                 lf.flush()
                     logger.info(
-                        "Task %s: main process exited (rc=%d) with %d pipe stream(s) still open "
-                        "(orphaned sub-process may hold pipe). Stopping reader.",
+                        "Task %s: main process exited (rc=%d) with %d pipe stream(s) still open. Stopping reader.",
                         task_id, proc.returncode, open_streams,
                     )
                     lf.write(
@@ -380,17 +538,23 @@ def _run_claude_sync(task_id: str, spec: str) -> None:
                     break
 
             sel.close()
-            # proc.wait() should return immediately: either the process already
-            # exited (normal path) or we broke out early (orphan-pipe path).
-            # 30-second safety net in case of an unexpected edge case.
+
+            # v2 Phase 1: explicit FD cleanup to prevent orphan pipe hangs
+            for fd in (proc.stdout, proc.stderr):
+                try:
+                    fd.close()
+                except Exception:
+                    pass
+
             try:
                 proc.wait(timeout=30)
             except subprocess.TimeoutExpired:
-                logger.warning("Task %s: proc.wait() timed out after early loop exit -- killing", task_id)
+                logger.warning("Task %s: proc.wait() timed out -- killing", task_id)
                 try:
                     os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
                 except (ProcessLookupError, OSError):
                     pass
+
             stdout = "".join(stdout_lines)
             stderr = "".join(stderr_lines)
 
@@ -399,8 +563,17 @@ def _run_claude_sync(task_id: str, spec: str) -> None:
 
         _active_pids.pop(task_id, None)
 
+        # v2 Phase 1: store builder discipline sections
+        if builder_sections:
+            _task_meta[task_id]["builder_sections"] = builder_sections
+
+        # v2 Phase 1: capture token usage
+        token_usage = _parse_token_usage(stdout + stderr)
+        if token_usage:
+            _task_meta[task_id]["token_usage"] = token_usage
+
         if proc.returncode == 0:
-            # v2: transition RUNNING -> COMPLETED_UNVERIFIED
+            task_success = True
             if _state_machine:
                 try:
                     _state_machine.transition(task_id, TaskState.COMPLETED_UNVERIFIED, reason="builder_exit_0")
@@ -428,7 +601,6 @@ def _run_claude_sync(task_id: str, spec: str) -> None:
             })
         else:
             result_text = f"Exit code {proc.returncode}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
-            # v2: classify failure and transition
             if _state_machine and _retry_budget:
                 try:
                     categories = classify_failure(result_text, _task_meta.get(task_id, {}))
@@ -462,7 +634,17 @@ def _run_claude_sync(task_id: str, spec: str) -> None:
 
     except subprocess.TimeoutExpired:
         _active_pids.pop(task_id, None)
+        # v2 Phase 1: collect partial output before killing
+        partial_output = "".join(stdout_lines) if 'stdout_lines' in dir() else ""
+        _task_meta[task_id]["partial_result"] = partial_output[-10000:] if partial_output else ""
+
         if proc:
+            # v2 Phase 1: explicit FD cleanup before kill
+            for fd in (proc.stdout, proc.stderr):
+                try:
+                    fd.close()
+                except Exception:
+                    pass
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
                 proc.wait(timeout=10)
@@ -471,14 +653,14 @@ def _run_claude_sync(task_id: str, spec: str) -> None:
                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-        timeout_result = f"Task timed out after {MAX_TASK_TIMEOUT}s"
-        # v2: classify timeout and transition
+
+        timeout_result = partial_output if partial_output else f"Task timed out after {kill_timeout}s (no output)"
         if _state_machine and _retry_budget:
             try:
                 categories = classify_failure(timeout_result, {**(_task_meta.get(task_id) or {}), "timeout": True})
                 _task_meta[task_id]["failure_categories"] = [c.value for c in categories]
                 _state_machine.transition(task_id, TaskState.FAILED_RETRYABLE,
-                                          reason=f"timeout_{MAX_TASK_TIMEOUT}s")
+                                          reason=f"inactivity_timeout_{kill_timeout}s")
                 remaining = _retry_budget.consume_retry(task_id, categories)
                 if remaining <= 0:
                     _state_machine.transition(task_id, TaskState.ESCALATED,
@@ -489,18 +671,17 @@ def _run_claude_sync(task_id: str, spec: str) -> None:
         else:
             _task_meta[task_id]["status"] = "failed"
         _task_meta[task_id]["result"] = timeout_result
-        logger.error("Task %s: timed out after %ds", task_id, MAX_TASK_TIMEOUT)
+        logger.error("Task %s: timed out after %ds inactivity", task_id, kill_timeout)
         _broadcast_task_update_sync(task_id)
         agent_bus.send({
             "from": "leroy", "to": "pm",
             "type": "deliverable_ready",
             "task_id": task_id,
-            "content": f"Task {task_id} TIMED OUT after {MAX_TASK_TIMEOUT}s.",
+            "content": f"Task {task_id} TIMED OUT ({kill_timeout}s inactivity). Partial output: {len(partial_output)} chars.",
             "context": f"Spec preview: {_task_meta[task_id].get('spec', '')[:120]}",
             "requires_response": False,
         })
     except Exception as e:
-        # v2: classify execution error
         if _state_machine:
             try:
                 categories = classify_failure(str(e), _task_meta.get(task_id) or {})
@@ -525,6 +706,8 @@ def _run_claude_sync(task_id: str, spec: str) -> None:
         })
     finally:
         _task_meta[task_id]["completed_at"] = datetime.now(timezone.utc).isoformat()
+        # v2 Phase 1: worktree cleanup
+        _cleanup_worktree(task_id, worktree_path, task_success)
         # Persist task outcome to Aianna -- non-blocking, handles brain unavailability
         try:
             _persist_manager.persist_task(task_id, _task_meta[task_id])
