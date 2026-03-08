@@ -17,6 +17,7 @@ import httpx
 from fastmcp import FastMCP
 
 import config
+from spec_analyzer import extract_typed_ir, check_dedup, check_complexity, check_preflight
 
 mcp = FastMCP("leroy-mcp")
 
@@ -203,6 +204,49 @@ async def leroy_send_spec(spec: str, subject: str = "") -> str:
         else ""
     )
 
+    # ---------------------------------------------------------------------------
+    # v2 Phase 2: Spec Analyzer pipeline
+    # ---------------------------------------------------------------------------
+    typed_ir = extract_typed_ir(spec, subject)
+    analyzer_notes = []
+
+    # Dedup check (fetch active/recent tasks for comparison)
+    dedup_override = "DEDUP_OVERRIDE" in subject
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(f"{_a2a_url()}/tasks", headers=_headers(),
+                                     params={"status": "working"})
+            active_tasks = resp.json().get("tasks", []) if resp.status_code == 200 else []
+            resp = await client.get(f"{_a2a_url()}/tasks", headers=_headers(),
+                                     params={"status": "completed", "limit": "20"})
+            recent_tasks = resp.json().get("tasks", []) if resp.status_code == 200 else []
+    except Exception:
+        active_tasks, recent_tasks = [], []
+
+    dedup = check_dedup(typed_ir, subject, active_tasks, recent_tasks)
+    if dedup["blocked"] and not dedup_override:
+        return f"BLOCKED: {dedup['message']}\nInclude DEDUP_OVERRIDE in subject to bypass."
+    if dedup["message"]:
+        analyzer_notes.append(dedup["message"])
+
+    # Complexity check
+    scope_override = "SCOPE_OVERRIDE" in subject
+    complexity = check_complexity(typed_ir, spec)
+    if complexity["warnings"]:
+        warnings_str = "\n".join(f"  - {w}" for w in complexity["warnings"])
+        analyzer_notes.append(f"Complexity warnings:\n{warnings_str}")
+
+    # Pre-flight check
+    preflight = check_preflight(typed_ir)
+    if preflight["blocked"]:
+        failed_checks = [c for c in preflight["checks"] if not c["up"]]
+        checks_str = ", ".join(f"{c['name']} ({c['host']}:{c['port']})" for c in failed_checks)
+        return f"BLOCKED: Pre-flight failed. Unreachable: {checks_str}\nFix infrastructure before sending."
+    if preflight["checks"]:
+        passed_str = ", ".join(c["name"] for c in preflight["checks"] if c["up"])
+        if passed_str:
+            analyzer_notes.append(f"Pre-flight passed: {passed_str}")
+
     today = date.today().isoformat()
     slug = _derive_slug(subject)
     spec_path = _unique_spec_path(today, slug)
@@ -279,11 +323,33 @@ async def leroy_send_spec(spec: str, subject: str = "") -> str:
         # Non-fatal: spec is saved, task_id update failed
         pass
 
+    # v2: store typed IR in task metadata via REST
+    try:
+        import json
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.patch(
+                f"{_a2a_url()}/tasks/{task_id}",
+                headers=_headers(),
+                json={"typed_ir": typed_ir.to_json()},
+            )
+    except Exception:
+        pass  # Non-fatal
+
     subject_line = f" ({subject})" if subject else ""
+    analyzer_summary = ""
+    if analyzer_notes:
+        analyzer_summary = "\n\nAnalyzer notes:\n" + "\n".join(f"  {n}" for n in analyzer_notes)
+    ir_summary = (
+        f"\nTyped IR: {len(typed_ir.criteria)} criteria, "
+        f"target={typed_ir.target or 'local'}, "
+        f"subsystem={typed_ir.subsystem or 'unknown'}, "
+        f"complexity={typed_ir.complexity}"
+    )
     return (
         f"Spec sent to Leroy{subject_line}. Task ID: {task_id}\n"
         f"Spec saved: {spec_path.name}\n"
         f"Leroy is working on it. Check progress with: leroy_check_task('{task_id}')\n"
+        f"{ir_summary}{analyzer_summary}"
         f"{override_warning}"
         f"\n{recent_summary}"
     )
