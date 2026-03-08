@@ -6,6 +6,7 @@ Custom endpoints for task status and management.
 Separate health server on HEALTH_PORT.
 """
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -253,6 +254,9 @@ Sub-task reporting: When you decompose work into sub-tasks and delegate to speci
   POST when subtask starts, POST again when done:
   Body update: {"subtask_id": "same-id", "name": "same", "status": "completed", "output": "result summary", "completed_at": "<ISO timestamp>"}
   Use status "failed" if the subtask fails."""
+
+# v2 Phase 3: Builder prompt version hash (computed once at module load)
+_BUILDER_PROMPT_VERSION = hashlib.sha256(LEROY_SYSTEM_PROMPT.encode()).hexdigest()[:16]
 
 
 def _setup_worktree(task_id: str) -> tuple[str | None, str | None]:
@@ -757,6 +761,9 @@ class LeroyExecutor(AgentExecutor):
                 _state_machine.initialize_task(task_id)
             except Exception as e:
                 logger.warning("v2 state machine init failed for %s: %s", task_id, e)
+
+        # v2 Phase 3: Store builder prompt version in task metadata
+        _task_meta[task_id]["builder_prompt_version"] = _BUILDER_PROMPT_VERSION
 
         logger.info("Task %s received (spec length: %d chars) -- launching execution", task_id, len(spec_text))
 

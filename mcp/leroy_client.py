@@ -6,6 +6,7 @@ the Leroy A2A server on localhost:9800.
 Sends specs, polls for completion, returns results. PM never leaves
 their terminal.
 """
+import hashlib
 import json
 import re
 import sys
@@ -19,7 +20,19 @@ from fastmcp import FastMCP
 import config
 from spec_analyzer import extract_typed_ir, check_dedup, check_complexity, check_preflight
 
+# Add server dir to path for task_db imports
+_SERVER_DIR = Path(__file__).parent.parent / "server"
+sys.path.insert(0, str(_SERVER_DIR))
+import task_db
+
 mcp = FastMCP("leroy-mcp")
+
+
+def _get_plan_store() -> task_db.PlanStore:
+    """Lazy-init task_db and return the plan store singleton."""
+    if task_db.plan_store is None:
+        task_db.init()
+    return task_db.plan_store
 
 # ---------------------------------------------------------------------------
 # Spec repository helpers
@@ -247,6 +260,28 @@ async def leroy_send_spec(spec: str, subject: str = "") -> str:
         if passed_str:
             analyzer_notes.append(f"Pre-flight passed: {passed_str}")
 
+    # v2 Phase 3: Create plan record before sending
+    plan_id = None
+    try:
+        store = _get_plan_store()
+        # Compute builder prompt version hash for the current system prompt
+        # (MCP client doesn't have the full prompt, just hash the IR + subject)
+        plan_id = store.create_plan(
+            spec_text=spec,
+            subject=subject or _derive_slug(subject),
+            typed_ir=typed_ir.to_json(),
+            complexity_score=typed_ir.complexity,
+            criteria_count=len(typed_ir.criteria),
+            target_machine=typed_ir.target,
+            subsystem=typed_ir.subsystem,
+            preflight_passed=preflight["passed"],
+            preflight_details=json.dumps(preflight["checks"]) if preflight["checks"] else None,
+            dedup_checked=True,
+            dedup_similar_task_id=dedup.get("overlapping_task_id"),
+        )
+    except Exception as e:
+        plan_id = None  # Non-fatal: plan creation failed
+
     today = date.today().isoformat()
     slug = _derive_slug(subject)
     spec_path = _unique_spec_path(today, slug)
@@ -313,6 +348,13 @@ async def leroy_send_spec(spec: str, subject: str = "") -> str:
 
     if not task_id:
         return f"Spec sent but could not extract task ID. Response: {response_text}"
+
+    # v2 Phase 3: Link plan to task
+    if plan_id and task_id:
+        try:
+            _get_plan_store().link_task(plan_id, task_id)
+        except Exception:
+            pass  # Non-fatal
 
     # Update saved spec file with real task_id
     try:
@@ -421,6 +463,21 @@ async def leroy_update_spec(task_id: str, pass_rate: str, retrospective: str) ->
     content = content + outcome_block
 
     target_file.write_text(content, encoding="utf-8")
+
+    # v2 Phase 3: Update plan record with outcome
+    try:
+        store = _get_plan_store()
+        plan = store.get_plan_by_task(task_id)
+        if plan:
+            store.update_outcome(
+                plan["plan_id"],
+                status=new_status,
+                pass_rate=pass_rate,
+                retro_text=retrospective,
+                outcome="verified" if new_status == "completed" else "failed",
+            )
+    except Exception:
+        pass  # Non-fatal
 
     return (
         f"Spec updated: {target_file.name}\n"
@@ -849,6 +906,168 @@ async def leroy_send_message(to: str, content: str, msg_type: str = "request",
         f"Type: {msg_type}\n"
         f"Content: {content[:100]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# v2 Phase 3: Plan Database MCP Tools
+# ---------------------------------------------------------------------------
+@mcp.tool()
+async def leroy_list_plans(status: str = "", since_date: str = "",
+                           limit: int = 50, subsystem: str = "",
+                           source: str = "") -> str:
+    """List plans from the plan database.
+
+    By default excludes v1 imports. Set source='v1_import' to see them.
+
+    Args:
+        status: Filter by status (draft, sent, completed, failed).
+        since_date: ISO date to filter from (e.g. '2026-03-01').
+        limit: Max results (default 50).
+        subsystem: Filter by subsystem (dashboard, server, mcp, monitor).
+        source: Filter by source ('v2' or 'v1_import'). Empty excludes v1.
+
+    Returns:
+        Formatted plan list.
+    """
+    try:
+        store = _get_plan_store()
+        plans = store.list_plans(
+            status=status or None,
+            since_date=since_date or None,
+            limit=limit,
+            subsystem=subsystem or None,
+            source=source or None,
+        )
+    except Exception as e:
+        return f"Error listing plans: {e}"
+
+    if not plans:
+        return "No plans found matching filters."
+
+    lines = [f"Plans ({len(plans)}):"]
+    for p in plans:
+        subject = p.get("subject", "untitled")[:50]
+        s = p.get("status", "?")
+        src = p.get("source", "v2")
+        sub = p.get("subsystem") or "?"
+        created = (p.get("created_at") or "")[:10]
+        pr = p.get("pass_rate") or ""
+        lines.append(f"  {created} | {p['plan_id']} | {s:<10} | {sub:<12} | {src} | {subject} | {pr}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def leroy_plan_report() -> str:
+    """Get aggregate plan statistics with separate v1/v2 baselines.
+
+    Returns:
+        Plan report with completion rates, costs, timeout rates, and respec counts.
+    """
+    try:
+        store = _get_plan_store()
+        report = store.plan_report()
+    except Exception as e:
+        return f"Error generating plan report: {e}"
+
+    lines = ["Plan Report:"]
+    for label, stats in [("v2", report["v2"]), ("v1_import", report["v1_import"]), ("Combined", report["combined"])]:
+        if stats["total"] == 0:
+            lines.append(f"\n  {label}: No plans")
+            continue
+        lines.append(f"\n  {label}:")
+        lines.append(f"    Total: {stats['total']}")
+        lines.append(f"    Completed: {stats.get('completed', 0)}")
+        lines.append(f"    Failed: {stats.get('failed', 0)}")
+        lines.append(f"    Total cost: ${stats.get('total_cost_usd', 0):.4f}")
+        lines.append(f"    Avg cost: ${stats.get('avg_cost_usd', 0):.4f}")
+        lines.append(f"    Respec count: {stats.get('respec_count', 0)}")
+        lines.append(f"    Timeouts: {stats.get('timeout_count', 0)}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def leroy_brain_gaps() -> str:
+    """Find plans where brain was not queried or results not persisted.
+
+    Returns:
+        List of non-compliant plans.
+    """
+    try:
+        store = _get_plan_store()
+        gaps = store.brain_gaps()
+    except Exception as e:
+        return f"Error checking brain gaps: {e}"
+
+    if not gaps:
+        return "No brain gaps found. All v2 plans are brain-compliant."
+
+    lines = [f"Brain gaps ({len(gaps)} plans):"]
+    for g in gaps:
+        queried = "queried" if g.get("brain_queried") else "NOT queried"
+        persisted = "persisted" if g.get("brain_persisted") else "NOT persisted"
+        lines.append(f"  {g['plan_id']} | {g.get('subject', '?')[:40]} | {queried} | {persisted}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def leroy_cost_report(since_date: str = "") -> str:
+    """Get token usage and cost breakdown by subsystem and day.
+
+    Args:
+        since_date: ISO date to filter from (e.g. '2026-03-01'). Empty = all time.
+
+    Returns:
+        Cost report with per-subsystem and per-day breakdowns.
+    """
+    try:
+        store = _get_plan_store()
+        report = store.cost_report(since_date=since_date or None)
+    except Exception as e:
+        return f"Error generating cost report: {e}"
+
+    lines = [f"Cost Report (total: ${report['total_cost_usd']:.4f}):"]
+
+    if report["by_subsystem"]:
+        lines.append("\n  By subsystem:")
+        for sub, stats in report["by_subsystem"].items():
+            lines.append(f"    {sub}: ${stats['cost']:.4f} ({stats['count']} plans, "
+                        f"{stats['input_tokens']} in / {stats['output_tokens']} out)")
+
+    if report["by_day"]:
+        lines.append("\n  By day:")
+        for day, stats in report["by_day"].items():
+            lines.append(f"    {day}: ${stats['cost']:.4f} ({stats['count']} plans)")
+
+    if not report["by_subsystem"] and not report["by_day"]:
+        lines.append("  No cost data recorded yet.")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def leroy_subsystem_health() -> str:
+    """Get per-subsystem pass rate and respec count.
+
+    Returns:
+        Health stats for each subsystem.
+    """
+    try:
+        store = _get_plan_store()
+        health = store.subsystem_health()
+    except Exception as e:
+        return f"Error generating subsystem health: {e}"
+
+    if not health:
+        return "No v2 plans recorded yet."
+
+    lines = ["Subsystem Health:"]
+    for sub, stats in sorted(health.items()):
+        lines.append(f"  {sub}:")
+        lines.append(f"    Total: {stats['total']}, Completed: {stats['completed']}, "
+                    f"Failed: {stats['failed']}")
+        lines.append(f"    Pass rate: {stats['pass_rate']:.0%}")
+        lines.append(f"    Respec count: {stats['respec_count']}")
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":

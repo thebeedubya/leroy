@@ -676,6 +676,306 @@ class ProposalStore:
 
 
 # ---------------------------------------------------------------------------
+# PlanStore -- plan database for spec tracking, metrics, and lineage
+# ---------------------------------------------------------------------------
+class PlanStore:
+    """SQLite-backed plan store for spec lifecycle tracking.
+
+    Plans are created when specs are sent (via leroy_send_spec) and updated
+    with outcomes when tasks complete. Supports v1 imports, lineage tracking,
+    aggregate reporting, and brain compliance auditing.
+    """
+
+    def __init__(self, db: "TaskDB"):
+        self._db = db
+        self._lock = threading.Lock()
+        self._init_plans_schema()
+        logger.info("PlanStore initialized")
+
+    def _init_plans_schema(self) -> None:
+        with self._db._write_lock:
+            self._db._conn.executescript("""
+                CREATE TABLE IF NOT EXISTS plans (
+                    plan_id TEXT PRIMARY KEY,
+                    task_id TEXT,
+                    spec_text TEXT NOT NULL,
+                    typed_ir TEXT,
+                    subject TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    source TEXT DEFAULT 'v2',
+                    complexity_score INTEGER,
+                    criteria_count INTEGER,
+                    target_machine TEXT,
+                    subsystem TEXT,
+                    brain_queried BOOLEAN DEFAULT 0,
+                    brain_lessons_attached TEXT,
+                    brain_persisted BOOLEAN DEFAULT 0,
+                    brain_persist_payload TEXT,
+                    builder_context_injected BOOLEAN DEFAULT 0,
+                    preflight_passed BOOLEAN,
+                    preflight_details TEXT,
+                    dedup_checked BOOLEAN DEFAULT 0,
+                    dedup_similar_task_id TEXT,
+                    status TEXT DEFAULT 'draft',
+                    pass_rate TEXT,
+                    duration_seconds INTEGER,
+                    outcome TEXT,
+                    failure_categories TEXT,
+                    retry_count INTEGER DEFAULT 0,
+                    max_retries INTEGER DEFAULT 2,
+                    token_usage_input INTEGER,
+                    token_usage_output INTEGER,
+                    estimated_cost_usd REAL,
+                    quality_score REAL,
+                    retro_text TEXT,
+                    parent_plan_id TEXT,
+                    respec_count INTEGER DEFAULT 0,
+                    version INTEGER DEFAULT 1,
+                    builder_prompt_version TEXT,
+                    builder_prompt_snapshot TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_plans_task_id ON plans(task_id);
+                CREATE INDEX IF NOT EXISTS idx_plans_status ON plans(status);
+                CREATE INDEX IF NOT EXISTS idx_plans_source ON plans(source);
+                CREATE INDEX IF NOT EXISTS idx_plans_subsystem ON plans(subsystem);
+                CREATE INDEX IF NOT EXISTS idx_plans_created_at ON plans(created_at);
+            """)
+            self._db._conn.commit()
+
+    def create_plan(self, spec_text: str, subject: str, typed_ir: dict | None = None,
+                    complexity_score: int | None = None, criteria_count: int | None = None,
+                    target_machine: str | None = None, subsystem: str | None = None,
+                    preflight_passed: bool | None = None, preflight_details: str | None = None,
+                    dedup_checked: bool = False, dedup_similar_task_id: str | None = None,
+                    source: str = "v2", outcome: str | None = None,
+                    builder_prompt_version: str | None = None,
+                    builder_prompt_snapshot: str | None = None,
+                    parent_plan_id: str | None = None) -> str:
+        """Create a new plan record. Returns plan_id."""
+        import uuid
+        plan_id = f"plan-{uuid.uuid4().hex[:12]}"
+        now = datetime.now(timezone.utc).isoformat()
+        with self._db._write_lock:
+            self._db._conn.execute(
+                """INSERT INTO plans (plan_id, spec_text, subject, typed_ir, created_at,
+                   source, complexity_score, criteria_count, target_machine, subsystem,
+                   preflight_passed, preflight_details, dedup_checked, dedup_similar_task_id,
+                   outcome, builder_prompt_version, builder_prompt_snapshot, parent_plan_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (plan_id, spec_text, subject, json.dumps(typed_ir) if typed_ir else None,
+                 now, source, complexity_score, criteria_count, target_machine, subsystem,
+                 preflight_passed, preflight_details, dedup_checked, dedup_similar_task_id,
+                 outcome, builder_prompt_version, builder_prompt_snapshot, parent_plan_id),
+            )
+            self._db._conn.commit()
+        return plan_id
+
+    def link_task(self, plan_id: str, task_id: str) -> None:
+        """Link a plan to its executing task."""
+        with self._db._write_lock:
+            self._db._conn.execute(
+                "UPDATE plans SET task_id = ?, status = 'sent' WHERE plan_id = ?",
+                (task_id, plan_id),
+            )
+            self._db._conn.commit()
+
+    def update_outcome(self, plan_id: str, status: str | None = None,
+                       pass_rate: str | None = None,
+                       failure_categories: list[str] | None = None,
+                       duration_seconds: int | None = None,
+                       token_usage_input: int | None = None,
+                       token_usage_output: int | None = None,
+                       estimated_cost_usd: float | None = None,
+                       retro_text: str | None = None,
+                       retry_count: int | None = None,
+                       outcome: str | None = None) -> None:
+        """Update plan with execution outcome."""
+        updates = []
+        params = []
+        for col, val in [
+            ("status", status), ("pass_rate", pass_rate),
+            ("failure_categories", json.dumps(failure_categories) if failure_categories else None),
+            ("duration_seconds", duration_seconds),
+            ("token_usage_input", token_usage_input), ("token_usage_output", token_usage_output),
+            ("estimated_cost_usd", estimated_cost_usd), ("retro_text", retro_text),
+            ("retry_count", retry_count), ("outcome", outcome),
+        ]:
+            if val is not None:
+                updates.append(f"{col} = ?")
+                params.append(val)
+        if not updates:
+            return
+        params.append(plan_id)
+        with self._db._write_lock:
+            self._db._conn.execute(
+                f"UPDATE plans SET {', '.join(updates)} WHERE plan_id = ?",
+                params,
+            )
+            self._db._conn.commit()
+
+    def get_plan(self, plan_id: str) -> dict | None:
+        """Get a single plan by plan_id."""
+        row = self._db._conn.execute(
+            "SELECT * FROM plans WHERE plan_id = ?", (plan_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_plan_by_task(self, task_id: str) -> dict | None:
+        """Get plan linked to a task_id."""
+        row = self._db._conn.execute(
+            "SELECT * FROM plans WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_plans(self, status: str | None = None, since_date: str | None = None,
+                   limit: int = 50, subsystem: str | None = None,
+                   source: str | None = None) -> list[dict]:
+        """List plans with optional filters."""
+        query = "SELECT * FROM plans WHERE 1=1"
+        params: list = []
+        if status:
+            query += " AND status = ?"
+            params.append(status)
+        if since_date:
+            query += " AND created_at >= ?"
+            params.append(since_date)
+        if subsystem:
+            query += " AND subsystem = ?"
+            params.append(subsystem)
+        if source:
+            query += " AND source = ?"
+            params.append(source)
+        else:
+            # Exclude v1 imports from default queries
+            query += " AND source != 'v1_import'"
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        rows = self._db._conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_lineage(self, plan_id: str) -> list[dict]:
+        """Get parent chain for a plan (oldest first)."""
+        chain = []
+        current_id = plan_id
+        seen = set()
+        while current_id and current_id not in seen:
+            seen.add(current_id)
+            plan = self.get_plan(current_id)
+            if not plan:
+                break
+            chain.append(plan)
+            current_id = plan.get("parent_plan_id")
+        chain.reverse()
+        return chain
+
+    def plan_report(self) -> dict:
+        """Aggregate stats across all plans, with separate v1/v2 baselines."""
+        rows = self._db._conn.execute("SELECT * FROM plans").fetchall()
+        plans = [dict(r) for r in rows]
+        v2_plans = [p for p in plans if p["source"] == "v2"]
+        v1_plans = [p for p in plans if p["source"] == "v1_import"]
+
+        def _stats(subset: list[dict]) -> dict:
+            total = len(subset)
+            if total == 0:
+                return {"total": 0}
+            completed = [p for p in subset if p.get("outcome") in ("verified", "completed")]
+            failed = [p for p in subset if p.get("status") == "failed"]
+            costs = [p["estimated_cost_usd"] for p in subset if p.get("estimated_cost_usd")]
+            respec = sum(1 for p in subset if (p.get("respec_count") or 0) > 0)
+            timeouts = sum(1 for p in subset if p.get("failure_categories") and "TIMEOUT" in p["failure_categories"])
+            return {
+                "total": total,
+                "completed": len(completed),
+                "failed": len(failed),
+                "total_cost_usd": round(sum(costs), 4) if costs else 0,
+                "avg_cost_usd": round(sum(costs) / len(costs), 4) if costs else 0,
+                "respec_count": respec,
+                "timeout_count": timeouts,
+            }
+
+        return {
+            "v2": _stats(v2_plans),
+            "v1_import": _stats(v1_plans),
+            "combined": _stats(plans),
+        }
+
+    def brain_gaps(self) -> list[dict]:
+        """Find plans where brain was not queried or results not persisted."""
+        rows = self._db._conn.execute(
+            "SELECT plan_id, task_id, subject, created_at, brain_queried, brain_persisted "
+            "FROM plans WHERE source = 'v2' AND (brain_queried = 0 OR brain_persisted = 0) "
+            "ORDER BY created_at DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def cost_report(self, since_date: str | None = None) -> dict:
+        """Token usage and cost breakdown by subsystem and day."""
+        query = "SELECT * FROM plans WHERE token_usage_input IS NOT NULL"
+        params: list = []
+        if since_date:
+            query += " AND created_at >= ?"
+            params.append(since_date)
+        rows = self._db._conn.execute(query, params).fetchall()
+        plans = [dict(r) for r in rows]
+
+        by_subsystem: dict[str, dict] = {}
+        by_day: dict[str, dict] = {}
+        total_cost = 0.0
+
+        for p in plans:
+            sub = p.get("subsystem") or "unknown"
+            day = (p.get("created_at") or "")[:10]
+            cost = p.get("estimated_cost_usd") or 0
+            inp = p.get("token_usage_input") or 0
+            out = p.get("token_usage_output") or 0
+            total_cost += cost
+
+            if sub not in by_subsystem:
+                by_subsystem[sub] = {"cost": 0, "input_tokens": 0, "output_tokens": 0, "count": 0}
+            by_subsystem[sub]["cost"] += cost
+            by_subsystem[sub]["input_tokens"] += inp
+            by_subsystem[sub]["output_tokens"] += out
+            by_subsystem[sub]["count"] += 1
+
+            if day not in by_day:
+                by_day[day] = {"cost": 0, "count": 0}
+            by_day[day]["cost"] += cost
+            by_day[day]["count"] += 1
+
+        return {
+            "total_cost_usd": round(total_cost, 4),
+            "by_subsystem": {k: {**v, "cost": round(v["cost"], 4)} for k, v in by_subsystem.items()},
+            "by_day": {k: {**v, "cost": round(v["cost"], 4)} for k, v in sorted(by_day.items())},
+        }
+
+    def subsystem_health(self) -> dict:
+        """Per-subsystem pass rate and respec count."""
+        rows = self._db._conn.execute(
+            "SELECT * FROM plans WHERE source = 'v2'"
+        ).fetchall()
+        plans = [dict(r) for r in rows]
+
+        by_sub: dict[str, dict] = {}
+        for p in plans:
+            sub = p.get("subsystem") or "unknown"
+            if sub not in by_sub:
+                by_sub[sub] = {"total": 0, "completed": 0, "failed": 0, "respec_count": 0}
+            by_sub[sub]["total"] += 1
+            if p.get("outcome") in ("verified", "completed"):
+                by_sub[sub]["completed"] += 1
+            if p.get("status") == "failed":
+                by_sub[sub]["failed"] += 1
+            by_sub[sub]["respec_count"] += p.get("respec_count") or 0
+
+        for sub, stats in by_sub.items():
+            stats["pass_rate"] = round(stats["completed"] / stats["total"], 2) if stats["total"] > 0 else 0
+
+        return by_sub
+
+
+# ---------------------------------------------------------------------------
 # Module-level singletons -- init() must be called before use
 # ---------------------------------------------------------------------------
 _db: TaskDB | None = None
@@ -685,11 +985,12 @@ msg_store: PersistentMessageStore | None = None
 agent_store: AgentStore | None = None
 activity_store: ActivityStore | None = None
 proposal_store: ProposalStore | None = None
+plan_store: PlanStore | None = None
 
 
 def init(db_path: Path | None = None) -> None:
     """Initialize the module-level singletons. Call once at server startup."""
-    global _db, task_meta, subtask_store, msg_store, agent_store, activity_store, proposal_store
+    global _db, task_meta, subtask_store, msg_store, agent_store, activity_store, proposal_store, plan_store
     path = db_path or DB_PATH
     _db = TaskDB(path)
     task_meta = PersistentTaskDict(_db)
@@ -698,4 +999,5 @@ def init(db_path: Path | None = None) -> None:
     agent_store = AgentStore(_db)
     activity_store = ActivityStore(_db)
     proposal_store = ProposalStore(_db)
+    plan_store = PlanStore(_db)
     logger.info("task_db initialized (path=%s)", path)
