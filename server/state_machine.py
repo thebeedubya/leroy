@@ -68,6 +68,7 @@ class TaskStateMachine:
         """Initialize with a task_meta dict-like object (PersistentTaskDict)."""
         self._task_meta = task_meta
         self._handlers: dict[tuple[TaskState, TaskState], list[Callable]] = {}
+        self._global_handlers: list[Callable] = []
         self._lock = threading.Lock()
 
     def initialize_task(self, task_id: str) -> dict:
@@ -150,6 +151,13 @@ class TaskStateMachine:
         # Fire registered handlers (outside lock)
         self._fire_handlers(from_state, to_state, event)
 
+        # Fire global handlers (e.g., SSE broadcast)
+        for handler in self._global_handlers:
+            try:
+                handler(event)
+            except Exception as e:
+                logger.error("Global handler error: %s", e, exc_info=True)
+
         return event
 
     def get_state(self, task_id: str) -> TaskState:
@@ -181,6 +189,14 @@ class TaskStateMachine:
             self._handlers[key] = []
         self._handlers[key].append(handler)
         logger.debug("Registered handler for %s -> %s", from_state.value, to_state.value)
+
+    def register_global_handler(self, handler: Callable) -> None:
+        """Register a handler that fires on every state transition.
+
+        Used for SSE broadcasting and activity logging.
+        """
+        self._global_handlers.append(handler)
+        logger.debug("Registered global handler")
 
     def _fire_handlers(self, from_state: TaskState, to_state: TaskState, event: dict) -> None:
         """Fire all registered handlers for a transition."""

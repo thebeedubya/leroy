@@ -268,3 +268,32 @@ def pending_count(agent: str | None = None) -> int:
             if m.get("requires_response") and not m.get("responded")
             and (agent is None or m.get("to") == agent)
         )
+
+
+def route_infra_to_ops(task_id: str, failure_description: str,
+                       categories: list[str] | None = None) -> dict:
+    """Route an infrastructure failure to ops for diagnosis.
+
+    Ops scope: diagnose and report only. No autonomous remediation.
+
+    Args:
+        task_id: The task that encountered the infra failure.
+        failure_description: What failed and what to diagnose.
+        categories: Optional failure category names.
+
+    Returns:
+        The sent message dict.
+    """
+    content = f"INFRA ALERT: Task {task_id} — {failure_description}"
+    if categories:
+        content += f"\nFailure categories: {', '.join(categories)}"
+    content += "\nScope: Diagnose and report findings. Do NOT remediate autonomously."
+
+    return send({
+        "from": "leroy",
+        "to": "ops",
+        "type": "infra_alert",
+        "task_id": task_id,
+        "content": content,
+        "requires_response": False,
+    })

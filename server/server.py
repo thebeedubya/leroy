@@ -51,6 +51,7 @@ import task_db
 from state_machine import TaskStateMachine, TaskState, IllegalTransitionError
 from failure_taxonomy import classify_failure, FailureCategory, is_infra_failure, INFRA_CATEGORIES
 from retry_budget import RetryBudget
+from task_events import register_all_handlers
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -137,6 +138,29 @@ def _broadcast_task_update_sync(task_id: str) -> None:
             dead.add(queue)
     for q in dead:
         _sse_subscribers.discard(q)
+
+def _broadcast_state_transition(task_id: str, from_state: str, to_state: str,
+                                reason: str = "", failure_categories: list | None = None) -> None:
+    """Broadcast a state machine transition event via SSE with full metadata."""
+    if not _sse_subscribers:
+        return
+    event_data = json.dumps({
+        "type": "state_transition",
+        "task_id": task_id,
+        "from_state": from_state,
+        "to_state": to_state,
+        "reason": reason,
+        "failure_categories": failure_categories or [],
+    })
+    dead = set()
+    for queue in list(_sse_subscribers):
+        try:
+            queue.put_nowait(event_data)
+        except Exception:
+            dead.add(queue)
+    for q in dead:
+        _sse_subscribers.discard(q)
+
 
 def _emit_activity(agent: str, event_type: str, summary: str,
                    detail: str | None = None, task_id: str | None = None,
@@ -2850,6 +2874,18 @@ def main():
     _state_machine = TaskStateMachine(_task_meta)
     _retry_budget = RetryBudget(_task_meta)
     logger.info("v2 state machine and retry budget initialized")
+
+    # v2 Phase 4: Register event handlers on state machine transitions
+    register_all_handlers(_state_machine, _retry_budget, _task_meta,
+                          broadcast_fn=_broadcast_task_update_sync)
+
+    # v2 Phase 4: SSE broadcast on every state transition
+    def _sse_state_handler(event: dict) -> None:
+        _broadcast_state_transition(
+            event["task_id"], event["from_state"], event["to_state"],
+            reason=event.get("reason", ""),
+        )
+    _state_machine.register_global_handler(_sse_state_handler)
 
     logger.info(
         "Task store loaded: %d task(s), %d subtask group(s), %d message(s)",
