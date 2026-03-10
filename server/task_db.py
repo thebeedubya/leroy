@@ -751,7 +751,9 @@ class PlanStore:
                     source: str = "v2", outcome: str | None = None,
                     builder_prompt_version: str | None = None,
                     builder_prompt_snapshot: str | None = None,
-                    parent_plan_id: str | None = None) -> str:
+                    parent_plan_id: str | None = None,
+                    brain_queried: bool = False,
+                    brain_lessons_attached: str | None = None) -> str:
         """Create a new plan record. Returns plan_id."""
         import uuid
         plan_id = f"plan-{uuid.uuid4().hex[:12]}"
@@ -761,12 +763,14 @@ class PlanStore:
                 """INSERT INTO plans (plan_id, spec_text, subject, typed_ir, created_at,
                    source, complexity_score, criteria_count, target_machine, subsystem,
                    preflight_passed, preflight_details, dedup_checked, dedup_similar_task_id,
-                   outcome, builder_prompt_version, builder_prompt_snapshot, parent_plan_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   outcome, builder_prompt_version, builder_prompt_snapshot, parent_plan_id,
+                   brain_queried, brain_lessons_attached)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (plan_id, spec_text, subject, json.dumps(typed_ir) if typed_ir else None,
                  now, source, complexity_score, criteria_count, target_machine, subsystem,
                  preflight_passed, preflight_details, dedup_checked, dedup_similar_task_id,
-                 outcome, builder_prompt_version, builder_prompt_snapshot, parent_plan_id),
+                 outcome, builder_prompt_version, builder_prompt_snapshot, parent_plan_id,
+                 brain_queried, brain_lessons_attached),
             )
             self._db._conn.commit()
         return plan_id
@@ -800,6 +804,35 @@ class PlanStore:
             ("token_usage_input", token_usage_input), ("token_usage_output", token_usage_output),
             ("estimated_cost_usd", estimated_cost_usd), ("retro_text", retro_text),
             ("retry_count", retry_count), ("outcome", outcome),
+        ]:
+            if val is not None:
+                updates.append(f"{col} = ?")
+                params.append(val)
+        if not updates:
+            return
+        params.append(plan_id)
+        with self._db._write_lock:
+            self._db._conn.execute(
+                f"UPDATE plans SET {', '.join(updates)} WHERE plan_id = ?",
+                params,
+            )
+            self._db._conn.commit()
+
+    def update_brain_fields(self, plan_id: str,
+                            brain_queried: bool | None = None,
+                            brain_lessons_attached: str | None = None,
+                            brain_persisted: bool | None = None,
+                            brain_persist_payload: str | None = None,
+                            builder_context_injected: bool | None = None) -> None:
+        """v2 Phase 5: Update brain integration fields on a plan record."""
+        updates = []
+        params = []
+        for col, val in [
+            ("brain_queried", brain_queried),
+            ("brain_lessons_attached", brain_lessons_attached),
+            ("brain_persisted", brain_persisted),
+            ("brain_persist_payload", brain_persist_payload),
+            ("builder_context_injected", builder_context_injected),
         ]:
             if val is not None:
                 updates.append(f"{col} = ?")
@@ -885,6 +918,8 @@ class PlanStore:
             costs = [p["estimated_cost_usd"] for p in subset if p.get("estimated_cost_usd")]
             respec = sum(1 for p in subset if (p.get("respec_count") or 0) > 0)
             timeouts = sum(1 for p in subset if p.get("failure_categories") and "TIMEOUT" in p["failure_categories"])
+            brain_queried = sum(1 for p in subset if p.get("brain_queried"))
+            brain_persisted = sum(1 for p in subset if p.get("brain_persisted"))
             return {
                 "total": total,
                 "completed": len(completed),
@@ -893,6 +928,8 @@ class PlanStore:
                 "avg_cost_usd": round(sum(costs) / len(costs), 4) if costs else 0,
                 "respec_count": respec,
                 "timeout_count": timeouts,
+                "brain_queried": brain_queried,
+                "brain_persisted": brain_persisted,
             }
 
         return {
@@ -986,11 +1023,13 @@ agent_store: AgentStore | None = None
 activity_store: ActivityStore | None = None
 proposal_store: ProposalStore | None = None
 plan_store: PlanStore | None = None
+container_store: "ContainerStore | None" = None
 
 
 def init(db_path: Path | None = None) -> None:
     """Initialize the module-level singletons. Call once at server startup."""
-    global _db, task_meta, subtask_store, msg_store, agent_store, activity_store, proposal_store, plan_store
+    global _db, task_meta, subtask_store, msg_store, agent_store, activity_store, proposal_store, plan_store, container_store
+    from container_store import ContainerStore
     path = db_path or DB_PATH
     _db = TaskDB(path)
     task_meta = PersistentTaskDict(_db)
@@ -1000,4 +1039,5 @@ def init(db_path: Path | None = None) -> None:
     activity_store = ActivityStore(_db)
     proposal_store = ProposalStore(_db)
     plan_store = PlanStore(_db)
+    container_store = ContainerStore(db_path=path)
     logger.info("task_db initialized (path=%s)", path)

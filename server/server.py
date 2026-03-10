@@ -10,6 +10,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import selectors
 import signal
 import shutil
@@ -52,6 +53,23 @@ from state_machine import TaskStateMachine, TaskState, IllegalTransitionError
 from failure_taxonomy import classify_failure, FailureCategory, is_infra_failure, INFRA_CATEGORIES
 from retry_budget import RetryBudget
 from task_events import register_all_handlers
+from knowledge_governance import governance_metrics as kg_metrics, prune_stale_knowledge
+from pm_autonomy import (
+    PMActionStore, classify_decision, evaluate_autonomy,
+    get_confidence_map, should_auto_execute,
+)
+from task_queue import TaskQueue
+from bus_webhooks import WebhookRegistry
+from quality_scoring import score_post_outcome, quality_metrics as qm_metrics
+from improvement_engine import (
+    analyze_patterns, learn_thresholds, find_golden_templates,
+    generate_suggestions, baseline_comparison, full_analysis,
+)
+from criteria_validator import (
+    validate_criteria, detect_hallucination, detect_drift,
+    make_verification_decision, ValidationResult,
+)
+from dispatcher import Dispatcher
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -85,8 +103,16 @@ _agent_store: task_db.AgentStore | None = None
 _activity_store: task_db.ActivityStore | None = None
 
 # v2 State machine + retry budget -- set in main()
+# v2 Phase 7: PM action store -- set in main()
+_action_store: PMActionStore | None = None
+# v2 Phase 8: Concurrency queue + webhook registry -- set in main()
+_task_queue: TaskQueue | None = None
+_webhook_registry: WebhookRegistry | None = None
 _state_machine: TaskStateMachine | None = None
 _retry_budget: RetryBudget | None = None
+
+# Dispatcher Phase 3a: Routing + Dependency Gating -- set in main()
+_dispatcher = None  # Dispatcher instance
 
 # SSE subscribers: set of asyncio.Queue instances for broadcasting task updates
 _sse_subscribers: set = set()
@@ -144,6 +170,8 @@ def _broadcast_state_transition(task_id: str, from_state: str, to_state: str,
     """Broadcast a state machine transition event via SSE with full metadata."""
     if not _sse_subscribers:
         return
+    # IC-12: Include parent_id so dashboard can filter vehicle events
+    parent_id = (_task_meta.get(task_id) or {}).get("parent_id") if _task_meta else None
     event_data = json.dumps({
         "type": "state_transition",
         "task_id": task_id,
@@ -151,6 +179,7 @@ def _broadcast_state_transition(task_id: str, from_state: str, to_state: str,
         "to_state": to_state,
         "reason": reason,
         "failure_categories": failure_categories or [],
+        "parent_id": parent_id,
     })
     dead = set()
     for queue in list(_sse_subscribers):
@@ -373,6 +402,28 @@ def _run_claude_sync(task_id: str, spec: str) -> None:
         _task_meta[task_id]["worktree_path"] = worktree_path
         _task_meta[task_id]["worktree_branch"] = branch_name
 
+    # v2 Phase 5B: Query brain for builder context
+    builder_system_prompt = LEROY_SYSTEM_PROMPT
+    try:
+        _plan_store = task_db.plan_store
+        _plan = _plan_store.get_plan_by_task(task_id) if _plan_store else None
+        _target = _plan.get("target") if _plan else None
+        _subsystem = _plan.get("subsystem") if _plan else None
+        _subject = _plan.get("subject", "") if _plan else ""
+        if _target or _subsystem:
+            _ctx = _persist_manager.build_builder_context(_target, _subsystem, _subject)
+            if _ctx.get("injected") and _ctx.get("context_text"):
+                builder_system_prompt = LEROY_SYSTEM_PROMPT + "\n\n" + _ctx["context_text"]
+                logger.info("Task %s: injected builder context (%d chars, %d results)",
+                            task_id, len(_ctx["context_text"]), _ctx.get("result_count", 0))
+                if _plan_store and _plan:
+                    try:
+                        _plan_store.update_brain_fields(_plan["plan_id"], builder_context_injected=True)
+                    except Exception as _ube:
+                        logger.warning("Task %s: failed to update builder_context_injected: %s", task_id, _ube)
+    except Exception as _bce:
+        logger.warning("Task %s: builder context query failed (using base prompt): %s", task_id, _bce)
+
     proc = None
     task_success = False
     try:
@@ -389,7 +440,7 @@ def _run_claude_sync(task_id: str, spec: str) -> None:
                     CLAUDE_BIN,
                     "-p", spec,
                     "--output-format", "text",
-                    "--system-prompt", LEROY_SYSTEM_PROMPT,
+                    "--system-prompt", builder_system_prompt,
                     "--dangerously-skip-permissions",
                     "--no-session-persistence",
                     "--model", "sonnet",
@@ -518,6 +569,11 @@ def _run_claude_sync(task_id: str, spec: str) -> None:
                                 try:
                                     _state_machine.transition(task_id, TaskState.BLOCKED,
                                                               reason=f"builder_blocked: {block_msg}")
+                                    # Dispatcher Phase 3a: route vehicle block for decision gating
+                                    if _dispatcher is not None and _task_meta.get(task_id, {}).get("parent_id"):
+                                        _dispatcher.handle_vehicle_blocked(
+                                            task_id, reason=block_msg
+                                        )
                                 except (IllegalTransitionError, KeyError) as e:
                                     logger.warning("v2 BLOCKED transition failed: %s", e)
 
@@ -610,6 +666,9 @@ def _run_claude_sync(task_id: str, spec: str) -> None:
                     _task_meta[task_id]["status"] = "completed"
             else:
                 _task_meta[task_id]["status"] = "completed"
+            # Dispatcher Phase 3a: route vehicle completion for dependency gating
+            if _dispatcher is not None and _task_meta.get(task_id, {}).get("parent_id"):
+                _dispatcher.handle_vehicle_completed(task_id)
             _task_meta[task_id]["result"] = stdout
             logger.info("Task %s: completed (%d chars output)", task_id, len(stdout))
             _broadcast_task_update_sync(task_id)
@@ -635,6 +694,11 @@ def _run_claude_sync(task_id: str, spec: str) -> None:
                     _task_meta[task_id]["failure_categories"] = [c.value for c in categories]
                     _state_machine.transition(task_id, TaskState.FAILED_RETRYABLE,
                                               reason=f"exit_{proc.returncode}: {','.join(c.value for c in categories)}")
+                    # Dispatcher Phase 3a: route vehicle failure for retry/decision gating
+                    if _dispatcher is not None and _task_meta.get(task_id, {}).get("parent_id"):
+                        _dispatcher.handle_vehicle_failed(
+                            task_id, reason=f"exit_{proc.returncode}"
+                        )
                     remaining = _retry_budget.consume_retry(task_id, categories)
                     if remaining <= 0 and not is_infra_failure(categories):
                         _state_machine.transition(task_id, TaskState.ESCALATED,
@@ -689,6 +753,11 @@ def _run_claude_sync(task_id: str, spec: str) -> None:
                 _task_meta[task_id]["failure_categories"] = [c.value for c in categories]
                 _state_machine.transition(task_id, TaskState.FAILED_RETRYABLE,
                                           reason=f"inactivity_timeout_{kill_timeout}s")
+                # Dispatcher Phase 3a: route vehicle timeout as failure
+                if _dispatcher is not None and _task_meta.get(task_id, {}).get("parent_id"):
+                    _dispatcher.handle_vehicle_failed(
+                        task_id, reason=f"inactivity_timeout_{kill_timeout}s"
+                    )
                 remaining = _retry_budget.consume_retry(task_id, categories)
                 if remaining <= 0:
                     _state_machine.transition(task_id, TaskState.ESCALATED,
@@ -716,6 +785,11 @@ def _run_claude_sync(task_id: str, spec: str) -> None:
                 _task_meta[task_id]["failure_categories"] = [c.value for c in categories]
                 _state_machine.transition(task_id, TaskState.FAILED_RETRYABLE,
                                           reason=f"execution_error: {e}")
+                # Dispatcher Phase 3a: route vehicle execution error as failure
+                if _dispatcher is not None and _task_meta.get(task_id, {}).get("parent_id"):
+                    _dispatcher.handle_vehicle_failed(
+                        task_id, reason=f"execution_error: {e}"
+                    )
             except (IllegalTransitionError, KeyError) as e2:
                 logger.warning("v2 exception handling error: %s", e2)
                 _task_meta[task_id]["status"] = "failed"
@@ -736,16 +810,18 @@ def _run_claude_sync(task_id: str, spec: str) -> None:
         _task_meta[task_id]["completed_at"] = datetime.now(timezone.utc).isoformat()
         # v2 Phase 1: worktree cleanup
         _cleanup_worktree(task_id, worktree_path, task_success)
-        # Persist task outcome to Aianna -- non-blocking, handles brain unavailability
-        try:
-            _persist_manager.persist_task(task_id, _task_meta[task_id])
-        except Exception as _pe:
-            logger.error("Task %s: persist_manager raised unexpectedly: %s", task_id, _pe)
+        # v2 Phase 5C: Brain persist now handled by state machine event handlers
+        # (on_build_completed, on_build_failed). Only persist here as fallback.
+        if not _state_machine:
+            try:
+                _persist_manager.persist_task(task_id, _task_meta[task_id])
+            except Exception as _pe:
+                logger.error("Task %s: persist_manager raised unexpectedly: %s", task_id, _pe)
 
 
 async def _execute_task(task_id: str, spec: str) -> None:
     """Run claude execution in a thread pool so it doesn't block the server."""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _run_claude_sync, task_id, spec)
 
 
@@ -777,6 +853,7 @@ class LeroyExecutor(AgentExecutor):
             "result": None,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "completed_at": None,
+            "parent_id": None,  # set to container_id for dispatcher vehicles (Phase 3)
         }
 
         # v2: Initialize state machine for this task
@@ -799,8 +876,44 @@ class LeroyExecutor(AgentExecutor):
         # Trigger persistence queue flush on task pickup (non-blocking)
         _persist_manager.flush_if_ready()
 
-        # Fire off execution in background (don't await -- let it run)
-        asyncio.create_task(_execute_task(task_id, spec_text))
+        # v2 Phase 8A: Enqueue through concurrency-controlled task queue
+        # Extract target machine from spec header (## Target: kush)
+        _target = "haze"
+        for _line in (spec_text or "").split("\n")[:20]:
+            if _line.strip().lower().startswith("## target:"):
+                _t = _line.split(":", 1)[1].strip().lower()
+                if _t in ("kush", "haze"):
+                    _target = _t
+                break
+
+        # Dispatcher Phase 3a: check if spec needs slicing into vehicles
+        _dispatched = False
+        if _dispatcher is not None:
+            try:
+                from spec_analyzer import extract_typed_ir
+                _typed_ir = extract_typed_ir(spec_text)
+                if _dispatcher.should_dispatch(_typed_ir, spec_text):
+                    _cid = _dispatcher.dispatch(
+                        spec_text=spec_text,
+                        typed_ir=_typed_ir,
+                        task_id=task_id,
+                        priority="normal",
+                        target_machine=_target,
+                    )
+                    if _cid:
+                        logger.info(
+                            "Task %s dispatched as container %s with vehicles", task_id, _cid
+                        )
+                        _task_meta[task_id]["status"] = "dispatched"
+                        _dispatched = True
+            except Exception as _de:
+                logger.warning(
+                    "Dispatcher intercept failed for task %s (fail-open to normal enqueue): %s",
+                    task_id, _de,
+                )
+
+        if not _dispatched:
+            _task_queue.enqueue(task_id, spec_text, priority="normal", target_machine=_target)
 
         _broadcast_task_update_sync(task_id)
 
@@ -820,6 +933,8 @@ class LeroyExecutor(AgentExecutor):
     ) -> None:
         task_id = context.task_id
         if task_id and task_id in _task_meta:
+            # NOTE: TaskState enum has no CANCELLED state; no state machine transition available.
+            # State machine gap: cancelled tasks bypass event handlers by design limitation.
             _task_meta[task_id]["status"] = "cancelled"
             logger.info("Task %s cancelled", task_id)
             await event_queue.enqueue_event(
@@ -922,7 +1037,13 @@ async def tasks_complete(request: Request) -> JSONResponse:
 
     is_qa_review = bool(body.get("qa_review", False))
     new_status = "qa_review" if is_qa_review else "completed"
-    _task_meta[task_id]["status"] = new_status
+    if not is_qa_review:
+        try:
+            if _state_machine:
+                _state_machine.transition(task_id, TaskState.COMPLETED_UNVERIFIED, reason="builder_reported_complete")
+        except Exception as _sm_err:
+            logger.warning("State machine transition failed for %s: %s", task_id, _sm_err)
+    _task_meta[task_id]["status"] = new_status  # fallback / legacy compat (qa_review has no state machine state)
     _task_meta[task_id]["result"] = result
     _task_meta[task_id]["completed_at"] = datetime.now(timezone.utc).isoformat()
     if is_qa_review:
@@ -981,11 +1102,104 @@ async def task_accept(request: Request) -> JSONResponse:
             status_code=409,
         )
 
-    _task_meta[task_id]["status"] = "working"
+    try:
+        if _state_machine:
+            _state_machine.transition(task_id, TaskState.RUNNING, reason="task_accepted_via_api")
+    except Exception as _sm_err:
+        logger.warning("State machine transition failed for %s: %s", task_id, _sm_err)
+    _task_meta[task_id]["status"] = "working"  # fallback / legacy compat
     _task_meta[task_id]["accepted_at"] = datetime.now(timezone.utc).isoformat()
     logger.info("Task %s accepted for execution", task_id)
     _broadcast_task_update_sync(task_id)
     return JSONResponse({"status": "ok", "task_id": task_id, "spec": _task_meta[task_id]["spec"]})
+
+
+def _compute_pipeline_stage(task: dict) -> dict:
+    """Compute pipeline stage and metadata for a task.
+
+    Returns a dict of pipeline_ fields to merge into the task response.
+    Uses task_db.plan_store for lifecycle metadata (retro_text, brain_persisted, pass_rate).
+    Fast: single DB lookup per task via plan_store.get_plan_by_task().
+    """
+    status = task.get("status", "pending")
+    task_id = task.get("task_id", "")
+    created = task.get("created_at", "")
+
+    # Check plan record for lifecycle fields
+    retro_text = None
+    brain_persisted = False
+    pass_rate = None
+
+    plan_store = task_db.plan_store
+    if plan_store and task_id:
+        try:
+            plan = plan_store.get_plan_by_task(task_id)
+            if plan:
+                retro_text = plan.get("retro_text") or None
+                brain_persisted = bool(plan.get("brain_persisted"))
+                pass_rate = plan.get("pass_rate") or None
+        except Exception:
+            pass
+
+    # Detect QA tasks by spec subject pattern
+    spec = task.get("spec", "")
+    subject_line = spec.split("\n")[0] if spec else ""
+    is_qa_task = bool(re.match(r"^#\s*QA[:\s]", subject_line, re.IGNORECASE))
+
+    # Compute age in seconds
+    age_seconds = None
+    if created:
+        try:
+            created_dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+            age_seconds = (datetime.now(timezone.utc) - created_dt).total_seconds()
+        except Exception:
+            pass
+
+    # Zombie detection: working > 4 hours with no recent activity
+    is_zombie = False
+    if status == "working" and age_seconds and age_seconds > 14400:
+        last_activity = task.get("last_activity")
+        if last_activity:
+            try:
+                la_dt = datetime.fromisoformat(last_activity.replace("Z", "+00:00"))
+                inactive_seconds = (datetime.now(timezone.utc) - la_dt).total_seconds()
+                if inactive_seconds > 14400:
+                    is_zombie = True
+            except Exception:
+                is_zombie = True
+        else:
+            is_zombie = True
+
+    # Stage mapping
+    if status == "idea":
+        stage = "draft"
+    elif status == "pending":
+        stage = "sent"
+    elif status in ("working", "waiting_for_pm"):
+        stage = "zombie" if is_zombie else "building"
+    elif status in ("qa_review", "completed_unverified"):
+        stage = "qa"
+    elif status == "completed":
+        if not retro_text and not pass_rate:
+            stage = "retro"
+        elif not brain_persisted:
+            stage = "persist"
+        else:
+            stage = "done"
+    elif status in ("failed", "cancelled"):
+        stage = "done"  # Failed/cancelled go to done (with failure indicator)
+    else:
+        stage = "sent"
+
+    return {
+        "pipeline_stage": stage,
+        "pipeline_is_zombie": is_zombie,
+        "pipeline_is_qa": is_qa_task,
+        "pipeline_age_seconds": int(age_seconds) if age_seconds is not None else None,
+        "pipeline_has_retro": bool(retro_text),
+        "pipeline_brain_persisted": brain_persisted,
+        "pipeline_pass_rate": pass_rate,
+    }
 
 
 async def tasks_list(request: Request) -> JSONResponse:
@@ -1003,7 +1217,14 @@ async def tasks_list(request: Request) -> JSONResponse:
     if not include_archived:
         tasks = [t for t in tasks if not t.get("archived", False)]
 
-    return JSONResponse({"tasks": tasks, "count": len(tasks)})
+    # Enrich each task with computed pipeline stage fields
+    enriched_tasks = []
+    for task in tasks:
+        enriched = dict(task)
+        enriched.update(_compute_pipeline_stage(task))
+        enriched_tasks.append(enriched)
+
+    return JSONResponse({"tasks": enriched_tasks, "count": len(enriched_tasks)})
 
 
 async def task_detail(request: Request) -> JSONResponse:
@@ -1016,7 +1237,10 @@ async def task_detail(request: Request) -> JSONResponse:
     if task_id not in _task_meta:
         return JSONResponse({"error": f"task {task_id} not found"}, status_code=404)
 
-    return JSONResponse(_task_meta[task_id])
+    task = _task_meta[task_id]
+    enriched = dict(task)
+    enriched.update(_compute_pipeline_stage(task))
+    return JSONResponse(enriched)
 
 
 async def task_cancel(request: Request) -> JSONResponse:
@@ -1035,6 +1259,8 @@ async def task_cancel(request: Request) -> JSONResponse:
             status_code=409,
         )
 
+    # NOTE: TaskState enum has no CANCELLED state; no state machine transition available.
+    # State machine gap: cancelled tasks bypass event handlers by design limitation.
     _task_meta[task_id]["status"] = "cancelled"
     logger.info("Task %s cancelled via REST", task_id)
     return JSONResponse({"status": "ok", "task_id": task_id})
@@ -1112,9 +1338,19 @@ async def task_review(request: Request) -> JSONResponse:
     now = datetime.now(timezone.utc).isoformat()
 
     if decision == "approved":
-        _task_meta[task_id]["status"] = "completed"
+        try:
+            if _state_machine:
+                _state_machine.transition(task_id, TaskState.COMPLETED_VERIFIED, reason="qa_approved")
+        except Exception as _sm_err:
+            logger.warning("State machine transition failed for %s: %s", task_id, _sm_err)
+        _task_meta[task_id]["status"] = "completed"  # fallback / legacy compat
     else:
-        _task_meta[task_id]["status"] = "failed"
+        try:
+            if _state_machine:
+                _state_machine.transition(task_id, TaskState.FAILED_RETRYABLE, reason="qa_rejected")
+        except Exception as _sm_err:
+            logger.warning("State machine transition failed for %s: %s", task_id, _sm_err)
+        _task_meta[task_id]["status"] = "failed"  # fallback / legacy compat
 
     _task_meta[task_id]["review_decision"] = decision
     _task_meta[task_id]["reviewed_at"] = now
@@ -1225,7 +1461,12 @@ async def pm_messages_receive(request: Request) -> JSONResponse:
     # Update task status to "waiting_for_pm" if blocking
     task_id = body.get("task_id")
     if requires_response and task_id and task_id in _task_meta:
-        _task_meta[task_id]["status"] = "waiting_for_pm"
+        try:
+            if _state_machine:
+                _state_machine.transition(task_id, TaskState.BLOCKED, reason="waiting_for_pm_response")
+        except Exception as _sm_err:
+            logger.warning("State machine transition failed for %s: %s", task_id, _sm_err)
+        _task_meta[task_id]["status"] = "waiting_for_pm"  # legacy compat (BLOCKED fires handlers; override string for UI)
         _task_meta[task_id]["waiting_on_message"] = message_id
         _broadcast_task_update_sync(task_id)
 
@@ -1291,7 +1532,12 @@ async def pm_messages_respond(request: Request) -> JSONResponse:
     task_id = msg.get("task_id")
     if task_id and task_id in _task_meta:
         if _task_meta[task_id].get("status") == "waiting_for_pm":
-            _task_meta[task_id]["status"] = "working"
+            try:
+                if _state_machine:
+                    _state_machine.transition(task_id, TaskState.RUNNING, reason="pm_response_received")
+            except Exception as _sm_err:
+                logger.warning("State machine transition failed for %s: %s", task_id, _sm_err)
+            _task_meta[task_id]["status"] = "working"  # fallback / legacy compat
             _task_meta[task_id].pop("waiting_on_message", None)
             _broadcast_task_update_sync(task_id)
 
@@ -1359,9 +1605,15 @@ async def bus_send(request: Request) -> JSONResponse:
 
     # If blocking message linked to a task, update task status
     if msg["requires_response"] and msg.get("task_id") and msg["task_id"] in _task_meta:
-        _task_meta[msg["task_id"]]["status"] = "waiting_for_pm"
-        _task_meta[msg["task_id"]]["waiting_on_message"] = msg["message_id"]
-        _broadcast_task_update_sync(msg["task_id"])
+        _bus_task_id = msg["task_id"]
+        try:
+            if _state_machine:
+                _state_machine.transition(_bus_task_id, TaskState.BLOCKED, reason="waiting_for_pm_response")
+        except Exception as _sm_err:
+            logger.warning("State machine transition failed for %s: %s", _bus_task_id, _sm_err)
+        _task_meta[_bus_task_id]["status"] = "waiting_for_pm"  # legacy compat (BLOCKED fires handlers; override string for UI)
+        _task_meta[_bus_task_id]["waiting_on_message"] = msg["message_id"]
+        _broadcast_task_update_sync(_bus_task_id)
 
     return JSONResponse({
         "message_id": msg["message_id"],
@@ -1426,7 +1678,12 @@ async def bus_respond(request: Request) -> JSONResponse:
     task_id = msg.get("task_id")
     if task_id and task_id in _task_meta:
         if _task_meta[task_id].get("status") == "waiting_for_pm":
-            _task_meta[task_id]["status"] = "working"
+            try:
+                if _state_machine:
+                    _state_machine.transition(task_id, TaskState.RUNNING, reason="message_response_received")
+            except Exception as _sm_err:
+                logger.warning("State machine transition failed for %s: %s", task_id, _sm_err)
+            _task_meta[task_id]["status"] = "working"  # fallback / legacy compat
             _task_meta[task_id].pop("waiting_on_message", None)
             _broadcast_task_update_sync(task_id)
 
@@ -1710,7 +1967,12 @@ def _stuck_task_detector() -> None:
                             task_id, pid
                         )
                         _active_pids.pop(task_id, None)
-                        meta["status"] = "failed"
+                        try:
+                            if _state_machine:
+                                _state_machine.transition(task_id, TaskState.FAILED_RETRYABLE, reason=f"process_{pid}_died_unexpectedly")
+                        except Exception as _sm_err:
+                            logger.warning("State machine transition failed for %s: %s", task_id, _sm_err)
+                        meta["status"] = "failed"  # fallback / legacy compat
                         meta["result"] = f"Process {pid} died unexpectedly. Check logs/{task_id}.log"
                         _broadcast_task_update_sync(task_id)
                         agent_bus.send({
@@ -1720,6 +1982,54 @@ def _stuck_task_detector() -> None:
                             "content": f"Task {task_id} FAILED -- subprocess PID {pid} died unexpectedly.",
                             "requires_response": False,
                         })
+                    continue  # Already handled by PID check
+
+                # Check 3: orphan detection -- task is working, no PID tracked,
+                # no subtasks, and no activity for a long time. This catches tasks
+                # that lost their PID on server restart or where the builder crashed
+                # before producing any output.
+                _ORPHAN_THRESHOLD = 600  # 10 minutes with no activity and no PID
+                last_activity = meta.get("last_activity", meta.get("created_at", ""))
+                if last_activity and not subtasks:
+                    try:
+                        activity_time = datetime.fromisoformat(last_activity)
+                        orphan_elapsed = (datetime.now(timezone.utc) - activity_time).total_seconds()
+                        if orphan_elapsed > _ORPHAN_THRESHOLD:
+                            logger.warning(
+                                "ORPHAN TASK DETECTED: %s -- no PID, no subtasks, no activity for %ds. Auto-failing.",
+                                task_id, int(orphan_elapsed)
+                            )
+                            now_iso = datetime.now(timezone.utc).isoformat()
+                            meta["_stuck_detected_at"] = now_iso
+                            meta["_stuck_reason"] = f"Orphan: no PID, no subtasks, no activity for {int(orphan_elapsed)}s"
+                            tracked = _task_meta[task_id]
+                            tracked["status"] = "failed"
+                            tracked["completed_at"] = now_iso
+                            tracked["result"] = (
+                                f"[Auto-failed by stuck detector: orphan task with no PID, no subtasks, "
+                                f"no activity for {int(orphan_elapsed)}s. Builder likely crashed on launch "
+                                f"or PID lost on server restart. Check logs/{task_id}.log]"
+                            )
+                            try:
+                                if _state_machine:
+                                    _state_machine.transition(task_id, TaskState.FAILED_RETRYABLE, reason="orphan_no_pid_no_activity")
+                            except Exception as _sm_err:
+                                logger.warning("State machine transition failed for %s: %s", task_id, _sm_err)
+                            _broadcast_task_update_sync(task_id)
+                            agent_bus.send({
+                                "from": "leroy", "to": "pm",
+                                "type": "deliverable_ready",
+                                "task_id": task_id,
+                                "content": (
+                                    f"Task {task_id} FAILED -- orphan detected. No active process, no subtasks, "
+                                    f"no activity for {int(orphan_elapsed)}s. Builder likely crashed on launch. "
+                                    f"Check logs/{task_id}.log"
+                                ),
+                                "requires_response": False,
+                            })
+                            logger.info("ORPHAN TASK %s: auto-failed successfully", task_id)
+                    except (ValueError, TypeError) as parse_err:
+                        logger.debug("Orphan check skipped for %s: %s", task_id, parse_err)
         except Exception:
             logger.exception("Stuck task detector error")
 
@@ -2423,7 +2733,7 @@ _INFRA_TOPOLOGY = [
     {
         "name": "Kush",
         "hostname": "kush",
-        "ip": "192.168.1.100",
+        "ip": "kush.local",
         "role": "Brain Infrastructure",
         "services": [
             {"name": "Qdrant", "port": 6333, "path": "/healthz"},
@@ -2475,7 +2785,7 @@ def _ping_service(ip: str, port: int, path: str, timeout: float = 2.0, protocol:
 async def infra_status(request: Request) -> JSONResponse:
     """GET /infra/status -- Returns infrastructure status with health pings (parallel)."""
     now = datetime.now(timezone.utc).isoformat()
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     async def ping_svc(machine, svc):
         protocol = svc.get("protocol", "http")
@@ -2553,7 +2863,134 @@ async def admin_circuit_reset(request: Request) -> JSONResponse:
     return JSONResponse(result)
 
 
-health_app = Starlette(routes=[Route("/health", health)])
+async def http_persist(request: Request) -> JSONResponse:
+    """POST /persist -- HTTP gateway for shell hooks to persist content to forge-brain.
+
+    Accepts JSON body with: content (required, min 100 chars), session_title (opt),
+    session_tags (opt list), source (opt, default "hook/http").
+    Returns: {"status": "queued"|"error", "queue_depth": int, "circuit_state": dict}
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"status": "error", "error": "invalid or missing JSON body"}, status_code=400)
+
+    content = body.get("content", "")
+    if not content or not isinstance(content, str):
+        return JSONResponse({"status": "error", "error": "missing required field: content"}, status_code=400)
+    if len(content) < 100:
+        return JSONResponse(
+            {"status": "error", "error": f"content too short: {len(content)} chars (minimum 100)"},
+            status_code=400,
+        )
+
+    payload = {
+        "id": uuid4().hex,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "attempt_count": 0,
+        "last_attempt": None,
+        "task_id": None,
+        "content": content,
+        "session_title": body.get("session_title") or "Hook Persist",
+        "session_tags": body.get("session_tags") or ["hook", "http"],
+        "source": body.get("source") or "hook/http",
+    }
+
+    _persist_manager._enqueue(payload)
+    # Layer 1+3: record this as a persist event for the given source
+    _persist_manager.record_persist(
+        payload.get("source", "hook/http"),
+        chars=len(content),
+        brain_ack=False,  # queued, not yet confirmed by brain
+    )
+    return JSONResponse({
+        "status": "queued",
+        "queue_depth": _persist_manager.queue_depth(),
+        "circuit_state": _persist_manager.circuit_state,
+    })
+
+
+async def http_persist_append(request: Request) -> JSONResponse:
+    """POST /persist/append -- Append content to an existing forge-brain session.
+
+    Accepts JSON body with: session_id (required), content (required, min 100 chars).
+    Calls forge-brain persist_append MCP tool via thread executor.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"status": "error", "error": "invalid or missing JSON body"}, status_code=400)
+
+    session_id = body.get("session_id", "")
+    content = body.get("content", "")
+    if not session_id or not isinstance(session_id, str):
+        return JSONResponse({"status": "error", "error": "missing required field: session_id"}, status_code=400)
+    if not content or not isinstance(content, str) or len(content) < 100:
+        return JSONResponse(
+            {"status": "error", "error": f"content too short or missing (minimum 100 chars)"},
+            status_code=400,
+        )
+
+    async def _call_append() -> dict:
+        from mcp.client.streamable_http import streamablehttp_client
+        from mcp import ClientSession
+        headers = {"Authorization": f"Bearer {config.FORGE_BRAIN_TOKEN}"}
+        async with streamablehttp_client(config.FORGE_BRAIN_URL, headers=headers, timeout=30.0) as (read, write, _):
+            async with ClientSession(read, write) as sess:
+                await sess.initialize()
+                result = await sess.call_tool("persist_append", {"session_id": session_id, "content": content})
+                return {"raw": str(result)[:200]}
+
+    try:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, lambda: asyncio.run(_call_append()))
+        return JSONResponse({"status": "appended", "circuit_state": _persist_manager.circuit_state})
+    except Exception as e:
+        logger.warning("http_persist_append failed: %s", e)
+        return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
+
+
+async def http_persist_last_get(request: Request) -> JSONResponse:
+    """GET /persist/last -- Return last persist timestamp for a source.
+
+    Query params:
+      source (optional): filter by source (e.g. "pm"). If omitted, return all sources.
+
+    Response: {"source": "pm", "last_persist": "ISO8601|null", "age_seconds": N|null, "stale": bool}
+    """
+    source = request.query_params.get("source")
+    result = _persist_manager.get_last_persist(source)
+    return JSONResponse(result)
+
+
+async def http_persist_last_post(request: Request) -> JSONResponse:
+    """POST /persist/last -- Record a persist event from an external caller (e.g. hook script).
+
+    Body: {"source": "pm", "timestamp": "ISO8601" (opt), "chars": N (opt)}
+    Updates in-memory tracking and appends to local ledger.
+    Response: {"status": "ok", "recorded": true}
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"status": "error", "error": "invalid JSON body"}, status_code=400)
+
+    source = body.get("source", "unknown")
+    timestamp = body.get("timestamp") or datetime.now(timezone.utc).isoformat()
+    chars = int(body.get("chars", 0))
+
+    _persist_manager.record_persist(source, timestamp=timestamp, chars=chars, brain_ack=True)
+    logger.debug("POST /persist/last: recorded source=%s ts=%s", source, timestamp)
+    return JSONResponse({"status": "ok", "recorded": True})
+
+
+health_app = Starlette(routes=[
+    Route("/health", health),
+    Route("/persist/last", http_persist_last_get, methods=["GET"]),
+    Route("/persist/last", http_persist_last_post, methods=["POST"]),
+    Route("/persist/append", http_persist_append, methods=["POST"]),
+    Route("/persist", http_persist, methods=["POST"]),
+])
 
 
 # ---------------------------------------------------------------------------
@@ -2762,6 +3199,485 @@ async def hooks_events_stream(request: Request) -> StreamingResponse:
 
 
 # ---------------------------------------------------------------------------
+# Plan endpoints (v2 Phase 3)
+# ---------------------------------------------------------------------------
+async def plans_list(request: Request) -> JSONResponse:
+    """GET /plans -- List plans with optional filters."""
+    store = task_db.plan_store
+    if store is None:
+        return JSONResponse({"plans": [], "count": 0})
+    status = request.query_params.get("status")
+    since_date = request.query_params.get("since_date")
+    subsystem = request.query_params.get("subsystem")
+    source = request.query_params.get("source")
+    limit = int(request.query_params.get("limit", "50"))
+    plans = store.list_plans(status=status, since_date=since_date,
+                             subsystem=subsystem, source=source, limit=limit)
+    return JSONResponse({"plans": plans, "count": len(plans)})
+
+
+async def plans_detail(request: Request) -> JSONResponse:
+    """GET /plans/{plan_id} -- Get a single plan."""
+    store = task_db.plan_store
+    if store is None:
+        return JSONResponse({"error": "plan store not initialized"}, status_code=500)
+    plan_id = request.path_params["plan_id"]
+    plan = store.get_plan(plan_id)
+    if plan is None:
+        return JSONResponse({"error": f"plan {plan_id} not found"}, status_code=404)
+    return JSONResponse(plan)
+
+
+async def plans_report(request: Request) -> JSONResponse:
+    """GET /plans/report -- Aggregate plan statistics."""
+    store = task_db.plan_store
+    if store is None:
+        return JSONResponse({"v2": {"total": 0}, "v1_import": {"total": 0}, "combined": {"total": 0}})
+    return JSONResponse(store.plan_report())
+
+
+async def plans_cost(request: Request) -> JSONResponse:
+    """GET /plans/cost -- Cost report by subsystem and day."""
+    store = task_db.plan_store
+    if store is None:
+        return JSONResponse({"total_cost_usd": 0, "by_subsystem": {}, "by_day": {}})
+    since_date = request.query_params.get("since_date")
+    return JSONResponse(store.cost_report(since_date=since_date))
+
+
+async def plans_subsystem_health(request: Request) -> JSONResponse:
+    """GET /plans/subsystem-health -- Per-subsystem pass rate."""
+    store = task_db.plan_store
+    if store is None:
+        return JSONResponse({})
+    return JSONResponse(store.subsystem_health())
+
+
+async def plans_brain_gaps(request: Request) -> JSONResponse:
+    """GET /plans/brain-gaps -- Plans where brain not queried/persisted."""
+    store = task_db.plan_store
+    if store is None:
+        return JSONResponse({"gaps": [], "count": 0})
+    gaps = store.brain_gaps()
+    return JSONResponse({"gaps": gaps, "count": len(gaps)})
+
+
+# ---------------------------------------------------------------------------
+# Criteria Validation endpoints (v2 Phase 11)
+# ---------------------------------------------------------------------------
+
+async def validate_task_criteria(request: Request) -> JSONResponse:
+    """POST /validate/{task_id} -- Validate builder output against spec criteria.
+
+    Optional body: {builder_claimed_pass: true}
+    Runs criteria validation, hallucination detection, and returns recommendation.
+    """
+    client = _check_auth(request)
+    if client is None:
+        return JSONResponse({"error": "authorization required"}, status_code=401)
+
+    task_id = request.path_params["task_id"]
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    # Get plan and task metadata
+    store = task_db.plan_store
+    plan = store.get_plan_by_task(task_id) if store else None
+    if not plan:
+        return JSONResponse({"error": f"no plan found for task {task_id}"}, status_code=404)
+
+    meta = _task_meta.get(task_id) or {}
+    typed_ir = plan.get("typed_ir")
+    if typed_ir and isinstance(typed_ir, str):
+        try:
+            typed_ir = json.loads(typed_ir)
+        except Exception:
+            typed_ir = {}
+    typed_ir = typed_ir or {}
+
+    builder_sections = meta.get("builder_sections", {})
+    result_text = meta.get("result", "") or meta.get("partial_result", "") or ""
+
+    # Run validation
+    validation = validate_criteria(
+        typed_ir, builder_sections, result_text,
+        task_id=task_id, plan_id=plan.get("plan_id", ""),
+    )
+
+    # Hallucination check
+    builder_claimed = body.get("builder_claimed_pass", False)
+    pass_rate = plan.get("pass_rate")
+    validation = detect_hallucination(validation, builder_claimed, pass_rate)
+
+    # Make decision
+    decision = make_verification_decision(validation, result_text=result_text)
+    validation.recommendation = decision
+
+    # Execute state transition if applicable
+    transition_result = None
+    if _state_machine and decision == "promote":
+        try:
+            _state_machine.transition(task_id, TaskState.COMPLETED_VERIFIED,
+                                       reason=f"criteria validation: {validation.verification_rate:.0%} verified")
+            transition_result = "promoted to COMPLETED_VERIFIED"
+        except Exception as e:
+            transition_result = f"transition failed: {e}"
+    elif _state_machine and decision == "fail":
+        try:
+            _state_machine.transition(task_id, TaskState.FAILED_RETRYABLE,
+                                       reason=f"criteria validation: {validation.hallucination_reason or 'low verification rate'}")
+            transition_result = "demoted to FAILED_RETRYABLE"
+        except Exception as e:
+            transition_result = f"transition failed: {e}"
+
+    resp = validation.to_json()
+    resp["transition_result"] = transition_result
+    return JSONResponse(resp)
+
+
+async def drift_detection(request: Request) -> JSONResponse:
+    """GET /validate/drift/{plan_id} -- Detect criteria drift from parent plan."""
+    plan_id = request.path_params["plan_id"]
+    store = task_db.plan_store
+    if store is None:
+        return JSONResponse({"error": "plan store not initialized"}, status_code=500)
+
+    plan = store.get_plan(plan_id)
+    if not plan:
+        return JSONResponse({"error": f"plan {plan_id} not found"}, status_code=404)
+
+    parent_id = plan.get("parent_plan_id")
+    if not parent_id:
+        return JSONResponse({"drift": None, "message": "no parent plan (not a respec)"})
+
+    parent = store.get_plan(parent_id)
+    if not parent:
+        return JSONResponse({"error": f"parent plan {parent_id} not found"}, status_code=404)
+
+    drift = detect_drift(parent, plan)
+    return JSONResponse(drift.to_json())
+
+
+# ---------------------------------------------------------------------------
+# Improvement Engine endpoints (v2 Phase 10)
+# ---------------------------------------------------------------------------
+
+async def improvement_patterns(request: Request) -> JSONResponse:
+    """GET /improvement/patterns -- Pattern correlations across plan data."""
+    store = task_db.plan_store
+    if store is None:
+        return JSONResponse({"error": "plan store not initialized"}, status_code=500)
+    return JSONResponse(analyze_patterns(store))
+
+
+async def improvement_thresholds(request: Request) -> JSONResponse:
+    """GET /improvement/thresholds -- Learned retry budgets, complexity levels, quality weights."""
+    store = task_db.plan_store
+    if store is None:
+        return JSONResponse({"error": "plan store not initialized"}, status_code=500)
+    return JSONResponse(learn_thresholds(store).to_json())
+
+
+async def improvement_templates(request: Request) -> JSONResponse:
+    """GET /improvement/templates -- Golden spec templates from subsystems with clean passes."""
+    store = task_db.plan_store
+    if store is None:
+        return JSONResponse({"error": "plan store not initialized"}, status_code=500)
+    templates = find_golden_templates(store)
+    return JSONResponse({"templates": templates, "count": len(templates)})
+
+
+async def improvement_suggestions(request: Request) -> JSONResponse:
+    """GET /improvement/suggestions -- Proactive improvement recommendations."""
+    store = task_db.plan_store
+    if store is None:
+        return JSONResponse({"error": "plan store not initialized"}, status_code=500)
+    suggestions = generate_suggestions(store)
+    return JSONResponse({"suggestions": suggestions, "count": len(suggestions)})
+
+
+async def improvement_baseline(request: Request) -> JSONResponse:
+    """GET /improvement/baseline -- v1 vs v2 baseline comparison."""
+    store = task_db.plan_store
+    if store is None:
+        return JSONResponse({"error": "plan store not initialized"}, status_code=500)
+    return JSONResponse(baseline_comparison(store))
+
+
+async def improvement_full(request: Request) -> JSONResponse:
+    """GET /improvement/analysis -- Full recursive improvement analysis."""
+    store = task_db.plan_store
+    if store is None:
+        return JSONResponse({"error": "plan store not initialized"}, status_code=500)
+    return JSONResponse(full_analysis(store))
+
+
+# ---------------------------------------------------------------------------
+# Quality Scoring endpoints (v2 Phase 9)
+# ---------------------------------------------------------------------------
+
+async def quality_score_task(request: Request) -> JSONResponse:
+    """POST /quality/score/{task_id} -- Compute post-outcome quality score for a task.
+
+    Body (optional): {pass_rate: "8/10", builder_claimed_pass: true, respec_count: 0}
+    If body is empty, pulls data from plan record.
+    """
+    client = _check_auth(request)
+    if client is None:
+        return JSONResponse({"error": "authorization required"}, status_code=401)
+    task_id = request.path_params["task_id"]
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    # Look up plan for this task
+    store = task_db.plan_store
+    plan = store.get_plan_by_task(task_id) if store else None
+    if not plan:
+        return JSONResponse({"error": f"no plan found for task {task_id}"}, status_code=404)
+
+    # Get task metadata
+    meta = _task_meta.get(task_id) or {}
+
+    pass_rate = body.get("pass_rate") or plan.get("pass_rate")
+    builder_claimed = body.get("builder_claimed_pass", False)
+    respec_count = body.get("respec_count", plan.get("respec_count", 0) or 0)
+    failure_categories = meta.get("failure_categories", [])
+    status = meta.get("status", "")
+
+    # Get pre-send score from plan
+    pre_send_score = plan.get("quality_score")
+
+    # Build a minimal pre-send breakdown if we have the score
+    from quality_scoring import QualityBreakdown
+    pre_breakdown = None
+    if pre_send_score is not None:
+        pre_breakdown = QualityBreakdown(
+            pre_send_score=pre_send_score,
+            total_score=pre_send_score,
+            phase="pre_send",
+        )
+
+    breakdown = score_post_outcome(
+        pre_send_breakdown=pre_breakdown,
+        pass_rate=pass_rate,
+        builder_claimed_pass=builder_claimed,
+        respec_count=respec_count,
+        failure_categories=failure_categories,
+        status=status,
+    )
+
+    # Store updated score on plan
+    try:
+        store.update_outcome(plan["plan_id"], quality_score=breakdown.total_score)
+    except Exception:
+        pass
+
+    return JSONResponse({
+        "task_id": task_id,
+        "plan_id": plan["plan_id"],
+        "quality_score": breakdown.total_score,
+        "pre_send_score": breakdown.pre_send_score,
+        "post_outcome_adjustment": breakdown.post_outcome_score,
+        "factors": breakdown.factors,
+    })
+
+
+async def quality_metrics_endpoint(request: Request) -> JSONResponse:
+    """GET /quality/metrics -- Aggregate quality metrics across all plans."""
+    store = task_db.plan_store
+    if store is None:
+        return JSONResponse({"error": "plan store not initialized"}, status_code=500)
+    metrics = qm_metrics(store)
+    return JSONResponse(metrics)
+
+
+# ---------------------------------------------------------------------------
+# Task Queue + Webhook endpoints (v2 Phase 8)
+# ---------------------------------------------------------------------------
+
+async def queue_status(request: Request) -> JSONResponse:
+    """GET /queue/status -- Current queue depth, active tasks, capacity."""
+    if _task_queue is None:
+        return JSONResponse({"error": "queue not initialized"}, status_code=500)
+    return JSONResponse(_task_queue.metrics())
+
+
+async def queue_tasks(request: Request) -> JSONResponse:
+    """GET /queue/tasks -- List tasks currently waiting in the queue."""
+    if _task_queue is None:
+        return JSONResponse({"tasks": [], "count": 0})
+    tasks = _task_queue.queued_tasks()
+    return JSONResponse({"tasks": tasks, "count": len(tasks)})
+
+
+async def webhook_register(request: Request) -> JSONResponse:
+    """POST /webhooks/register -- Register a webhook for an agent.
+
+    Body: {agent: "pm", url: "http://localhost:9802/hook", events: ["message"]}
+    """
+    client = _check_auth(request)
+    if client is None:
+        return JSONResponse({"error": "authorization required"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    agent = body.get("agent")
+    url = body.get("url")
+    if not agent or not url:
+        return JSONResponse({"error": "agent and url required"}, status_code=400)
+    events = body.get("events")
+    if _webhook_registry is None:
+        return JSONResponse({"error": "webhook registry not initialized"}, status_code=500)
+    result = _webhook_registry.register(agent, url, events)
+    status = 201 if result.get("registered") else 400
+    return JSONResponse(result, status_code=status)
+
+
+async def webhook_unregister(request: Request) -> JSONResponse:
+    """POST /webhooks/{webhook_id}/unregister -- Remove a webhook."""
+    client = _check_auth(request)
+    if client is None:
+        return JSONResponse({"error": "authorization required"}, status_code=401)
+    webhook_id = request.path_params["webhook_id"]
+    if _webhook_registry is None:
+        return JSONResponse({"error": "webhook registry not initialized"}, status_code=500)
+    removed = _webhook_registry.unregister(webhook_id)
+    if removed:
+        return JSONResponse({"status": "ok", "webhook_id": webhook_id})
+    return JSONResponse({"error": "webhook not found"}, status_code=404)
+
+
+async def webhook_list(request: Request) -> JSONResponse:
+    """GET /webhooks -- List webhook registrations, optional ?agent= filter."""
+    if _webhook_registry is None:
+        return JSONResponse({"webhooks": [], "count": 0})
+    agent = request.query_params.get("agent")
+    regs = _webhook_registry.list_registrations(agent)
+    return JSONResponse({"webhooks": regs, "count": len(regs)})
+
+
+async def webhook_metrics(request: Request) -> JSONResponse:
+    """GET /webhooks/metrics -- Webhook delivery stats."""
+    if _webhook_registry is None:
+        return JSONResponse({"error": "webhook registry not initialized"}, status_code=500)
+    return JSONResponse(_webhook_registry.metrics())
+
+
+# ---------------------------------------------------------------------------
+# PM Autonomy endpoints (v2 Phase 7)
+# ---------------------------------------------------------------------------
+
+async def pm_actions_list(request: Request) -> JSONResponse:
+    """GET /pm/actions -- List PM decisions with optional filters.
+
+    Query params: ?action_type=auto_qa, ?status=completed, ?limit=50
+    """
+    client = _check_auth(request)
+    if client is None:
+        return JSONResponse({"error": "authorization required"}, status_code=401)
+    if _action_store is None:
+        return JSONResponse({"actions": [], "count": 0})
+    action_type = request.query_params.get("action_type")
+    status = request.query_params.get("status")
+    limit = int(request.query_params.get("limit", "50"))
+    actions = _action_store.list_actions(action_type=action_type, status=status, limit=limit)
+    return JSONResponse({"actions": actions, "count": len(actions)})
+
+
+async def pm_actions_outcome(request: Request) -> JSONResponse:
+    """POST /pm/actions/{decision_id}/outcome -- Record whether a PM decision was correct.
+
+    Body: {"correct": true|false}
+    Used by Brad or QA results to train the autonomy expansion protocol.
+    """
+    client = _check_auth(request)
+    if client is None:
+        return JSONResponse({"error": "authorization required"}, status_code=401)
+    decision_id = request.path_params["decision_id"]
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    correct = body.get("correct")
+    if correct is None:
+        return JSONResponse({"error": "correct (true/false) required"}, status_code=400)
+    if _action_store is None:
+        return JSONResponse({"error": "action store not initialized"}, status_code=500)
+    _action_store.update_status(decision_id, "completed", outcome_correct=bool(correct))
+    return JSONResponse({"status": "ok", "decision_id": decision_id, "outcome_correct": bool(correct)})
+
+
+async def pm_autonomy_status(request: Request) -> JSONResponse:
+    """GET /pm/autonomy -- Current autonomy tier assignments and stats."""
+    if _action_store is None:
+        return JSONResponse({"tiers": {}, "stats": {}})
+    tiers = get_confidence_map()
+    stats = {}
+    for action_type in tiers:
+        stats[action_type] = _action_store.action_stats(action_type)
+    return JSONResponse({"tiers": tiers, "stats": stats})
+
+
+async def pm_autonomy_evaluate(request: Request) -> JSONResponse:
+    """POST /pm/autonomy/evaluate -- Run autonomy expansion protocol.
+
+    Evaluates all action types and promotes/demotes based on outcome data.
+    """
+    client = _check_auth(request)
+    if client is None:
+        return JSONResponse({"error": "authorization required"}, status_code=401)
+    if _action_store is None:
+        return JSONResponse({"error": "action store not initialized"}, status_code=500)
+    result = evaluate_autonomy(_action_store)
+    return JSONResponse(result)
+
+
+async def pm_auto_approve_check(request: Request) -> JSONResponse:
+    """POST /pm/actions/auto-approve -- Check and execute pending auto-approvals.
+
+    MEDIUM-tier decisions that have passed their 30-min window get auto-approved.
+    """
+    client = _check_auth(request)
+    if client is None:
+        return JSONResponse({"error": "authorization required"}, status_code=401)
+    if _action_store is None:
+        return JSONResponse({"approved": [], "count": 0})
+    pending = _action_store.pending_auto_approvals()
+    approved = []
+    for action in pending:
+        _action_store.update_status(action["decision_id"], "approved")
+        approved.append(action["decision_id"])
+        logger.info("Auto-approved PM action %s (type=%s, created=%s)",
+                     action["decision_id"], action["action_type"], action["created_at"])
+    return JSONResponse({"approved": approved, "count": len(approved)})
+
+
+# ---------------------------------------------------------------------------
+# Knowledge governance endpoints (v2 Phase 6)
+# ---------------------------------------------------------------------------
+
+async def knowledge_governance_stats(request: Request) -> JSONResponse:
+    """GET /knowledge/governance -- Knowledge governance metrics."""
+    metrics = kg_metrics()
+    return JSONResponse(metrics)
+
+
+async def knowledge_prune(request: Request) -> JSONResponse:
+    """POST /knowledge/prune -- Trigger stale knowledge pruning."""
+    client = _check_auth(request)
+    if client is None:
+        return JSONResponse({"error": "authorization required"}, status_code=401)
+    result = prune_stale_knowledge(_persist_manager)
+    return JSONResponse(result)
+
+
+# ---------------------------------------------------------------------------
 # Build combined ASGI app
 # ---------------------------------------------------------------------------
 def build_app():
@@ -2831,12 +3747,54 @@ def build_app():
         Route("/ideas", ideas_create, methods=["POST"]),
         # Specs pipeline
         Route("/specs", specs_list, methods=["GET"]),
+        # Plans (v2 Phase 3)
+        Route("/plans/report", plans_report, methods=["GET"]),
+        Route("/plans/cost", plans_cost, methods=["GET"]),
+        Route("/plans/subsystem-health", plans_subsystem_health, methods=["GET"]),
+        Route("/plans/brain-gaps", plans_brain_gaps, methods=["GET"]),
+        Route("/plans/{plan_id}", plans_detail, methods=["GET"]),
+        Route("/plans", plans_list, methods=["GET"]),
+        # Criteria Validation (v2 Phase 11)
+        Route("/validate/drift/{plan_id}", drift_detection, methods=["GET"]),
+        Route("/validate/{task_id}", validate_task_criteria, methods=["POST"]),
+        # Improvement Engine (v2 Phase 10)
+        Route("/improvement/analysis", improvement_full, methods=["GET"]),
+        Route("/improvement/patterns", improvement_patterns, methods=["GET"]),
+        Route("/improvement/thresholds", improvement_thresholds, methods=["GET"]),
+        Route("/improvement/templates", improvement_templates, methods=["GET"]),
+        Route("/improvement/suggestions", improvement_suggestions, methods=["GET"]),
+        Route("/improvement/baseline", improvement_baseline, methods=["GET"]),
+        # Quality Scoring (v2 Phase 9)
+        Route("/quality/score/{task_id}", quality_score_task, methods=["POST"]),
+        Route("/quality/metrics", quality_metrics_endpoint, methods=["GET"]),
+        # Task Queue (v2 Phase 8A)
+        Route("/queue/status", queue_status, methods=["GET"]),
+        Route("/queue/tasks", queue_tasks, methods=["GET"]),
+        # Webhooks (v2 Phase 8B)
+        Route("/webhooks/register", webhook_register, methods=["POST"]),
+        Route("/webhooks/{webhook_id}/unregister", webhook_unregister, methods=["POST"]),
+        Route("/webhooks/metrics", webhook_metrics, methods=["GET"]),
+        Route("/webhooks", webhook_list, methods=["GET"]),
+        # PM Autonomy (v2 Phase 7)
+        Route("/pm/actions/auto-approve", pm_auto_approve_check, methods=["POST"]),
+        Route("/pm/actions/{decision_id}/outcome", pm_actions_outcome, methods=["POST"]),
+        Route("/pm/actions", pm_actions_list, methods=["GET"]),
+        Route("/pm/autonomy/evaluate", pm_autonomy_evaluate, methods=["POST"]),
+        Route("/pm/autonomy", pm_autonomy_status, methods=["GET"]),
+        # Knowledge governance (v2 Phase 6)
+        Route("/knowledge/governance", knowledge_governance_stats, methods=["GET"]),
+        Route("/knowledge/prune", knowledge_prune, methods=["POST"]),
         # Brain health proxy
         Route("/brain/health", brain_health, methods=["GET"]),
         # Infrastructure status
         Route("/infra/status", infra_status, methods=["GET"]),
         # Admin
         Route("/admin/circuit-reset", admin_circuit_reset, methods=["POST"]),
+        # HTTP persist gateway (no auth -- localhost only, for shell hooks)
+        Route("/persist/last", http_persist_last_get, methods=["GET"]),
+        Route("/persist/last", http_persist_last_post, methods=["POST"]),
+        Route("/persist/append", http_persist_append, methods=["POST"]),
+        Route("/persist", http_persist, methods=["POST"]),
         # Claude Code hook receivers (no auth -- localhost only)
         Route("/hooks/tool-use", hooks_tool_use, methods=["POST"]),
         Route("/hooks/subagent", hooks_subagent, methods=["POST"]),
@@ -2856,7 +3814,7 @@ def build_app():
 # ---------------------------------------------------------------------------
 def main():
     """Start Leroy A2A server + health server."""
-    global _task_meta, _subtask_store, _agent_store, _activity_store, _proposal_store, _state_machine, _retry_budget
+    global _task_meta, _subtask_store, _agent_store, _activity_store, _proposal_store, _state_machine, _retry_budget, _action_store, _task_queue, _webhook_registry, _dispatcher
 
     auth.load_tokens()
 
@@ -2873,11 +3831,118 @@ def main():
     # v2 State machine + retry budget
     _state_machine = TaskStateMachine(_task_meta)
     _retry_budget = RetryBudget(_task_meta)
-    logger.info("v2 state machine and retry budget initialized")
+
+    # v2 Phase 7: PM action store
+    _action_store = PMActionStore(task_db._db)
+    logger.info("v2 state machine, retry budget, and PM action store initialized")
+
+    # Dispatcher Phase 1: Container recovery sweep (IC-9)
+    # Detects stale vehicles from previous runs and logs container state.
+    # Routing/reconvergence actions are deferred to Phase 3.
+    if task_db.container_store is not None:
+        try:
+            task_db.container_store.recovery_sweep_containers(
+                task_meta_getter=_task_meta.get,
+                state_machine_ref=_state_machine,
+            )
+        except Exception as _e:
+            logger.warning("Dispatcher recovery sweep failed (non-fatal): %s", _e)
+
+    # v2 Phase 8A: Concurrency-controlled task queue
+    _task_queue = TaskQueue(execute_fn=_execute_task, concurrency=None)
+
+    # Dispatcher Phase 3a: Routing + Dependency Gating
+    if task_db.container_store is not None:
+        _dispatcher = Dispatcher(
+            container_store=task_db.container_store,
+            task_queue=_task_queue,
+            task_meta=_task_meta,
+            state_machine=_state_machine,
+        )
+        logger.info("Dispatcher Phase 3a initialized (routing + dependency gating)")
+    else:
+        logger.warning("Dispatcher Phase 3a: container_store not available -- dispatcher disabled")
+
+    # v2 Phase 8B: Webhook registry for bus push delivery
+    _webhook_registry = WebhookRegistry(db=task_db._db)
+    agent_bus.set_webhook_registry(_webhook_registry)
 
     # v2 Phase 4: Register event handlers on state machine transitions
     register_all_handlers(_state_machine, _retry_budget, _task_meta,
-                          broadcast_fn=_broadcast_task_update_sync)
+                          broadcast_fn=_broadcast_task_update_sync,
+                          persist_manager=_persist_manager,
+                          action_store=_action_store)
+
+    # v2 Phase 11: Auto-validate on COMPLETED_UNVERIFIED entry
+    def _auto_validate_handler(event: dict) -> None:
+        """RUNNING -> COMPLETED_UNVERIFIED: Run criteria validation and auto-transition.
+
+        Calls validate_criteria -> detect_hallucination -> make_verification_decision.
+        Promotes to COMPLETED_VERIFIED or demotes to FAILED_RETRYABLE based on result.
+        If decision is 'review' or validation errors out, leaves task as COMPLETED_UNVERIFIED.
+        """
+        task_id = event["task_id"]
+        try:
+            store = task_db.plan_store
+            plan = store.get_plan_by_task(task_id) if store else None
+            if not plan:
+                logger.info("Auto-validate: no plan for %s, leaving as COMPLETED_UNVERIFIED", task_id)
+                return
+
+            meta = _task_meta.get(task_id) or {}
+            typed_ir = plan.get("typed_ir")
+            if typed_ir and isinstance(typed_ir, str):
+                try:
+                    typed_ir = json.loads(typed_ir)
+                except Exception:
+                    typed_ir = {}
+            typed_ir = typed_ir or {}
+
+            builder_sections = meta.get("builder_sections", {})
+            result_text = meta.get("result", "") or meta.get("partial_result", "") or ""
+
+            # Run criteria validation
+            validation = validate_criteria(
+                typed_ir, builder_sections, result_text,
+                task_id=task_id, plan_id=plan.get("plan_id", ""),
+            )
+
+            # Hallucination check (builder_claimed_pass=False for auto-validation path)
+            pass_rate = plan.get("pass_rate")
+            validation = detect_hallucination(validation, False, pass_rate)
+
+            decision = make_verification_decision(validation, result_text=result_text)
+            validation.recommendation = decision
+
+            logger.info(
+                "Auto-validate %s: decision=%s, verification_rate=%.0%%",
+                task_id, decision, validation.verification_rate,
+            )
+
+            if decision == "promote":
+                try:
+                    _state_machine.transition(
+                        task_id, TaskState.COMPLETED_VERIFIED,
+                        reason=f"auto-validate: {validation.verification_rate:.0%} verified",
+                    )
+                except Exception as e:
+                    logger.warning("Auto-validate promote failed for %s: %s", task_id, e)
+            elif decision == "fail":
+                try:
+                    _state_machine.transition(
+                        task_id, TaskState.FAILED_RETRYABLE,
+                        reason=f"auto-validate fail: {validation.hallucination_reason or 'low verification rate'}",
+                    )
+                except Exception as e:
+                    logger.warning("Auto-validate fail-transition failed for %s: %s", task_id, e)
+            # decision == "review": leave as COMPLETED_UNVERIFIED for PM manual review
+
+        except Exception as e:
+            logger.error("Auto-validate handler error for %s: %s", task_id, e, exc_info=True)
+            # Leave as COMPLETED_UNVERIFIED -- do not crash the task flow
+
+    _state_machine.register_handler(TaskState.RUNNING, TaskState.COMPLETED_UNVERIFIED, _auto_validate_handler)
+    logger.info("Auto-validate handler registered for RUNNING -> COMPLETED_UNVERIFIED")
 
     # v2 Phase 4: SSE broadcast on every state transition
     def _sse_state_handler(event: dict) -> None:
@@ -2886,6 +3951,94 @@ def main():
             reason=event.get("reason", ""),
         )
     _state_machine.register_global_handler(_sse_state_handler)
+
+    # Ops task lifecycle notifications: auto-notify ops (and PM on failures)
+    # when tasks reach terminal or significant states.
+    def _ops_lifecycle_handler(event: dict) -> None:
+        """Send bus notifications to ops (and PM on failures) for terminal state transitions."""
+        to_state = event.get("to_state", "")
+        task_id = event["task_id"]
+        reason = event.get("reason", "")
+
+        # Only act on states we care about
+        _notify_states = {
+            TaskState.COMPLETED_VERIFIED.value,
+            TaskState.COMPLETED_UNVERIFIED.value,
+            TaskState.FAILED_RETRYABLE.value,
+            TaskState.ESCALATED.value,
+        }
+        if to_state not in _notify_states:
+            return
+
+        # Extract subject: first H1/H2 heading line from spec, else first 80 chars
+        meta = _task_meta.get(task_id) or {}
+        spec = meta.get("spec", "")
+        subject = ""
+        for _ln in spec.splitlines():
+            _stripped = _ln.strip().lstrip("#").strip()
+            if _stripped:
+                subject = _stripped[:80]
+                break
+        if not subject:
+            subject = "(no subject)"
+
+        error_summary = reason[:120] if reason else "unknown error"
+
+        if to_state == TaskState.COMPLETED_VERIFIED.value:
+            agent_bus.send({
+                "from": "leroy",
+                "to": "ops",
+                "type": "task_completion",
+                "task_id": task_id,
+                "content": f"Task {task_id} completed and verified. Subject: {subject}. No action needed.",
+                "requires_response": False,
+            })
+        elif to_state == TaskState.COMPLETED_UNVERIFIED.value:
+            agent_bus.send({
+                "from": "leroy",
+                "to": "ops",
+                "type": "task_completion",
+                "task_id": task_id,
+                "content": f"Task {task_id} completed but unverified. Subject: {subject}. May need manual review.",
+                "requires_response": False,
+            })
+        elif to_state == TaskState.FAILED_RETRYABLE.value:
+            agent_bus.send({
+                "from": "leroy",
+                "to": "ops",
+                "type": "task_completion",
+                "task_id": task_id,
+                "content": f"Task {task_id} failed (retryable). Subject: {subject}. Error: {error_summary}.",
+                "requires_response": False,
+            })
+            agent_bus.send({
+                "from": "leroy",
+                "to": "pm",
+                "type": "task_completion",
+                "task_id": task_id,
+                "content": f"Task {task_id} failed (retryable). Subject: {subject}. Error: {error_summary}.",
+                "requires_response": False,
+            })
+        elif to_state == TaskState.ESCALATED.value:
+            agent_bus.send({
+                "from": "leroy",
+                "to": "ops",
+                "type": "task_completion",
+                "task_id": task_id,
+                "content": f"Task {task_id} failed (terminal). Subject: {subject}. Error: {error_summary}. PM notified.",
+                "requires_response": False,
+            })
+            agent_bus.send({
+                "from": "leroy",
+                "to": "pm",
+                "type": "task_completion",
+                "task_id": task_id,
+                "content": f"Task {task_id} failed (terminal/escalated). Subject: {subject}. Error: {error_summary}.",
+                "requires_response": False,
+            })
+
+    _state_machine.register_global_handler(_ops_lifecycle_handler)
+    logger.info("Ops lifecycle notification handler registered for terminal state transitions")
 
     logger.info(
         "Task store loaded: %d task(s), %d subtask group(s), %d message(s)",
@@ -2911,12 +4064,33 @@ def main():
     _emit_activity("leroy", "status_update", "Leroy A2A server started",
                    detail=f"Port {config.PORT}, {len(_task_meta)} task(s) loaded")
 
+    # Notify ops that the server has started (restart detection)
+    agent_bus.send({
+        "from": "leroy",
+        "to": "ops",
+        "type": "status_update",
+        "content": f"Leroy A2A server started. Uptime: 0s. Version: {config.AGENT_VERSION}.",
+        "requires_response": False,
+    })
+    logger.info("Startup notification sent to ops via agent bus")
+
     # Start persistence manager (background retry thread + startup queue flush)
     _persist_manager.start()
+
+    # v2 Phase 8B: Start webhook delivery background thread
+    _webhook_registry.start()
 
     # Legacy broker flush thread removed -- webhook is dead, agent_bus handles messaging
 
     app = build_app()
+
+    # v2 Phase 8A: Start task queue dispatcher on uvicorn's event loop via startup hook
+    async def _start_task_queue():
+        loop = asyncio.get_running_loop()
+        _task_queue.start(loop)
+        logger.info("v2 task queue started on uvicorn event loop")
+
+    app.add_event_handler("startup", _start_task_queue)
 
     logger.info(
         "Starting Leroy A2A server on %s:%d (health on %d)",
