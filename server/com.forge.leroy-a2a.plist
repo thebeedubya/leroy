@@ -38,6 +38,8 @@
         <string>/Users/brad.wood/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>LEROY_WORK_DIR</key>
         <string>/Users/brad.wood/Projects/leroy</string>
+        <key>FORGE_BRAIN_TOKEN</key>
+        <string>SET_ME</string>
     </dict>
 </dict>
 </plist>

@@ -28,11 +28,8 @@ TOKENS_FILE = os.getenv(
 
 # Forge-brain (Aianna) persistence
 # Token: shared claude-code-haze token (7 tokens issued, leroy uses same instance)
-FORGE_BRAIN_URL = os.getenv("FORGE_BRAIN_URL", "http://192.168.1.100:8300/mcp")
-FORGE_BRAIN_TOKEN = os.getenv(
-    "FORGE_BRAIN_TOKEN",
-    "FORGE_BRAIN_TOKEN_REDACTED",
-)
+FORGE_BRAIN_URL = os.getenv("FORGE_BRAIN_URL", "http://kush.local:8300/mcp")
+FORGE_BRAIN_TOKEN = os.getenv("FORGE_BRAIN_TOKEN", "")
 
 # Agent identity
 AGENT_NAME = "Leroy"
