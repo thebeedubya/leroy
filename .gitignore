@@ -16,5 +16,6 @@ data/*.db-wal
 data/*.json
 data/*.log
 logs/
+specs/
 .secrets*
 .env.*
