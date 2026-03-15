@@ -5,6 +5,9 @@ the Leroy A2A server on localhost:9800.
 
 Sends specs, polls for completion, returns results. PM never leaves
 their terminal.
+
+v2 Phase 5A: Brain query integration in leroy_send_spec (check_before_act,
+lessons attached to plan record).
 """
 import hashlib
 import json
@@ -14,18 +17,26 @@ from datetime import date
 from pathlib import Path
 from uuid import uuid4
 
+# Make sibling MCP modules and server-side shared modules importable when
+# Codex launches this file directly as a script.
+_MCP_DIR = Path(__file__).parent
+_SERVER_DIR = _MCP_DIR.parent / "server"
+sys.path.insert(0, str(_SERVER_DIR))
+sys.path.insert(0, str(_MCP_DIR))
+
 import httpx
 from fastmcp import FastMCP
 
 import config
 from spec_analyzer import extract_typed_ir, check_dedup, check_complexity, check_preflight
-
-# Add server dir to path for task_db imports
-_SERVER_DIR = Path(__file__).parent.parent / "server"
-sys.path.insert(0, str(_SERVER_DIR))
+from task_analytics import score_pre_send
 import task_db
+import persist_manager as pm
 
 mcp = FastMCP("leroy-mcp")
+
+# v2 Phase 5A: Shared PersistenceManager for brain queries from MCP client
+_brain = pm.PersistenceManager()
 
 
 def _get_plan_store() -> task_db.PlanStore:
@@ -218,6 +229,52 @@ async def leroy_send_spec(spec: str, subject: str = "") -> str:
     )
 
     # ---------------------------------------------------------------------------
+    # Layer 1: Persist gate -- block new specs if PM hasn't persisted to brain recently
+    # ---------------------------------------------------------------------------
+    if "PERSIST_OVERRIDE" not in subject.upper():
+        persist_stale = False
+        persist_warning = ""
+        try:
+            # Try server endpoint first (2s timeout to keep leroy_send_spec fast)
+            import urllib.request as _urllib_request, json as _json_persist
+            req = _urllib_request.Request("http://localhost:9801/persist/last?source=pm")
+            with _urllib_request.urlopen(req, timeout=2) as resp:
+                data = _json_persist.loads(resp.read())
+                if data.get("stale", True):
+                    age = data.get("age_seconds")
+                    if age is not None:
+                        hours = age // 3600
+                        persist_stale = True
+                        persist_warning = f"PM has not persisted to brain in {hours}+ hours."
+                    else:
+                        persist_stale = True
+                        persist_warning = "PM has never persisted to brain in this server lifetime."
+        except Exception:
+            # Server down -- check local ledger fallback
+            import os as _os, time as _time
+            ledger = _os.path.expanduser("~/.forge/logs/persist-ledger.json")
+            if _os.path.exists(ledger):
+                mtime = _os.path.getmtime(ledger)
+                age = _time.time() - mtime
+                if age > 14400:
+                    persist_stale = True
+                    persist_warning = f"Local ledger stale ({int(age // 3600)}+ hours). Server unreachable."
+                # else: ledger is fresh, fail open -- no block
+            else:
+                # Neither server nor ledger available -- fail open with loud warning
+                persist_stale = False
+                persist_warning = "CRITICAL: Cannot verify brain persist status. Persist context immediately."
+                override_warning += f"\n{persist_warning}\n"
+
+        if persist_stale:
+            return (
+                f"BLOCKED by persist gate: {persist_warning}\n\n"
+                f"Persist your current context to brain (call mcp__aianna__persist_on or persist_append),\n"
+                f"then resend the spec.\n"
+                f'Add PERSIST_OVERRIDE to subject to bypass (emergency only).'
+            )
+
+    # ---------------------------------------------------------------------------
     # v2 Phase 2: Spec Analyzer pipeline
     # ---------------------------------------------------------------------------
     typed_ir = extract_typed_ir(spec, subject)
@@ -260,12 +317,52 @@ async def leroy_send_spec(spec: str, subject: str = "") -> str:
         if passed_str:
             analyzer_notes.append(f"Pre-flight passed: {passed_str}")
 
+    # ---------------------------------------------------------------------------
+    # v2 Phase 5A: Brain query (Gate 0) -- check_before_act
+    # ---------------------------------------------------------------------------
+    brain_queried = False
+    brain_lessons_text = None
+    brain_override = "BRAIN_OVERRIDE" in subject
+
+    if not brain_override:
+        brain_result = _brain.check_before_act(subject or spec[:200])
+        brain_queried = brain_result.get("queried", False)
+
+        if brain_queried:
+            warnings = brain_result.get("warnings", [])
+            lessons = brain_result.get("lessons", [])
+
+            if warnings:
+                warnings_str = "\n".join(f"  - {w}" for w in warnings[:5])
+                analyzer_notes.append(f"Brain warnings:\n{warnings_str}")
+
+            if lessons:
+                # Format lessons for attachment to spec
+                lesson_lines = []
+                for lesson in lessons[:5]:
+                    if isinstance(lesson, dict):
+                        lesson_lines.append(f"- {lesson.get('content', lesson.get('lesson', str(lesson)))}")
+                    else:
+                        lesson_lines.append(f"- {lesson}")
+                brain_lessons_text = "\n".join(lesson_lines)
+                analyzer_notes.append(f"Brain lessons ({len(lessons)} found)")
+
+            # Attach raw response for debugging
+            raw = brain_result.get("raw", "")
+            if raw and not warnings and not lessons:
+                # check_before_act returned text, not structured data
+                brain_lessons_text = raw[:500]
+                analyzer_notes.append("Brain: check_before_act returned unstructured response")
+        else:
+            error = brain_result.get("error", "unknown")
+            analyzer_notes.append(f"Brain: unavailable ({error}), proceeding without lessons")
+
+    # ---------------------------------------------------------------------------
     # v2 Phase 3: Create plan record before sending
+    # ---------------------------------------------------------------------------
     plan_id = None
     try:
         store = _get_plan_store()
-        # Compute builder prompt version hash for the current system prompt
-        # (MCP client doesn't have the full prompt, just hash the IR + subject)
         plan_id = store.create_plan(
             spec_text=spec,
             subject=subject or _derive_slug(subject),
@@ -278,9 +375,29 @@ async def leroy_send_spec(spec: str, subject: str = "") -> str:
             preflight_details=json.dumps(preflight["checks"]) if preflight["checks"] else None,
             dedup_checked=True,
             dedup_similar_task_id=dedup.get("overlapping_task_id"),
+            brain_queried=brain_queried,
+            brain_lessons_attached=brain_lessons_text,
         )
     except Exception as e:
         plan_id = None  # Non-fatal: plan creation failed
+
+    # v2 Phase 9: Pre-send quality scoring
+    quality_breakdown = score_pre_send(
+        typed_ir, spec,
+        brain_queried=brain_queried,
+        dedup_result=dedup,
+        preflight_result=preflight,
+        complexity_result=complexity,
+    )
+    pre_send_quality = quality_breakdown.total_score
+
+    # Store pre-send score on plan record
+    if plan_id:
+        try:
+            store = _get_plan_store()
+            store.update_outcome(plan_id, quality_score=pre_send_quality)
+        except Exception:
+            pass  # Non-fatal
 
     today = date.today().isoformat()
     slug = _derive_slug(subject)
@@ -299,14 +416,19 @@ async def leroy_send_spec(spec: str, subject: str = "") -> str:
         "---\n\n"
     )
 
+    # v2 Phase 5A: Append brain lessons to spec if available
+    spec_with_lessons = spec
+    if brain_lessons_text:
+        spec_with_lessons = spec + f"\n\n## Prior Lessons (from Aianna brain)\n{brain_lessons_text}\n"
+
     # Read 10 most recent specs BEFORE saving this one
     recent_files = _get_recent_spec_files(10)
     recent_summary = _format_recent_specs_summary(recent_files)
 
-    # Save spec to disk
-    spec_path.write_text(front_matter + spec, encoding="utf-8")
+    # Save spec to disk (with lessons appended)
+    spec_path.write_text(front_matter + spec_with_lessons, encoding="utf-8")
 
-    # Send to A2A
+    # Send to A2A (send spec with lessons so builder has context)
     message_id = uuid4().hex
     payload = {
         "jsonrpc": "2.0",
@@ -315,7 +437,7 @@ async def leroy_send_spec(spec: str, subject: str = "") -> str:
         "params": {
             "message": {
                 "role": "user",
-                "parts": [{"kind": "text", "text": spec}],
+                "parts": [{"kind": "text", "text": spec_with_lessons}],
                 "messageId": message_id,
             }
         },
@@ -387,11 +509,15 @@ async def leroy_send_spec(spec: str, subject: str = "") -> str:
         f"subsystem={typed_ir.subsystem or 'unknown'}, "
         f"complexity={typed_ir.complexity}"
     )
+    brain_summary = f"\nBrain: {'queried' if brain_queried else 'skipped'}"
+    if brain_lessons_text:
+        brain_summary += f", {len(brain_lessons_text)} chars of lessons attached"
+    quality_summary = f"\nQuality score: {pre_send_quality:.2f} (pre-send)"
     return (
         f"Spec sent to Leroy{subject_line}. Task ID: {task_id}\n"
         f"Spec saved: {spec_path.name}\n"
         f"Leroy is working on it. Check progress with: leroy_check_task('{task_id}')\n"
-        f"{ir_summary}{analyzer_summary}"
+        f"{ir_summary}{brain_summary}{quality_summary}{analyzer_summary}"
         f"{override_warning}"
         f"\n{recent_summary}"
     )
@@ -952,7 +1078,8 @@ async def leroy_list_plans(status: str = "", since_date: str = "",
         sub = p.get("subsystem") or "?"
         created = (p.get("created_at") or "")[:10]
         pr = p.get("pass_rate") or ""
-        lines.append(f"  {created} | {p['plan_id']} | {s:<10} | {sub:<12} | {src} | {subject} | {pr}")
+        brain = "B" if p.get("brain_queried") else "-"
+        lines.append(f"  {created} | {p['plan_id']} | {s:<10} | {sub:<12} | {src} | {brain} | {subject} | {pr}")
     return "\n".join(lines)
 
 
@@ -982,6 +1109,8 @@ async def leroy_plan_report() -> str:
         lines.append(f"    Avg cost: ${stats.get('avg_cost_usd', 0):.4f}")
         lines.append(f"    Respec count: {stats.get('respec_count', 0)}")
         lines.append(f"    Timeouts: {stats.get('timeout_count', 0)}")
+        lines.append(f"    Brain queried: {stats.get('brain_queried', 0)}")
+        lines.append(f"    Brain persisted: {stats.get('brain_persisted', 0)}")
     return "\n".join(lines)
 
 
@@ -1068,6 +1197,115 @@ async def leroy_subsystem_health() -> str:
         lines.append(f"    Pass rate: {stats['pass_rate']:.0%}")
         lines.append(f"    Respec count: {stats['respec_count']}")
     return "\n".join(lines)
+
+
+@mcp.tool()
+async def leroy_tail_task(task_id: str, lines: int = 50) -> str:
+    """Tail a running task's log with live observability fields.
+
+    Single HTTP call to GET /tasks/{task_id}/logs?tail={lines}.
+    Returns status, log lines, PID info, elapsed time, CPU %, target, and
+    container info in a human-readable format.
+
+    Args:
+        task_id: The task ID to inspect.
+        lines: Number of log tail lines to return (default 50).
+
+    Returns:
+        Formatted observability output, or error if task/log not found.
+    """
+    async with httpx.AsyncClient(timeout=15) as client:
+        try:
+            resp = await client.get(
+                f"{_a2a_url()}/tasks/{task_id}/logs",
+                headers=_headers(),
+                params={"tail": str(lines)},
+            )
+        except httpx.ConnectError:
+            return "Cannot reach Leroy A2A server. Is it running on port 9800?"
+        except Exception as e:
+            return f"Error fetching task logs: {e}"
+
+    data = resp.json()
+
+    # Handle errors
+    if resp.status_code == 404:
+        error = data.get("error", "task or log not found")
+        # Check if it's a missing log vs missing task
+        if "no log file" in error:
+            # Task exists but no log yet -- show what we have
+            status = data.get("status", "unknown")
+            elapsed = data.get("elapsed_seconds")
+            target = data.get("target", "haze")
+            is_container = data.get("is_container", False)
+            vehicle_ids = data.get("vehicle_ids") or []
+
+            out = [
+                f"Task: {task_id}",
+                f"Status: {status}",
+                f"Target: {target}",
+                f"Elapsed: {elapsed:.0f}s" if elapsed is not None else "Elapsed: unknown",
+                "",
+                "No log file yet (task may be queued or pre-execution).",
+            ]
+            if is_container:
+                out.append(f"Container task. Vehicle IDs: {', '.join(vehicle_ids)}")
+                out.append("Tail individual vehicles for log output.")
+            return "\n".join(out)
+        return f"Task {task_id} not found."
+
+    if resp.status_code != 200:
+        return f"Error {resp.status_code}: {data.get('error', 'unknown error')}"
+
+    # --- Format response ---
+    status = data.get("status", "unknown")
+    elapsed = data.get("elapsed_seconds")
+    cpu = data.get("cpu_percent")
+    target = data.get("target", "haze")
+    remote_hint = data.get("remote_log_hint")
+    is_container = data.get("is_container", False)
+    vehicle_ids = data.get("vehicle_ids") or []
+    process = data.get("process") or {}
+    log_lines = data.get("log_lines", [])
+    total_lines = data.get("total_lines", 0)
+    showing = data.get("showing", 0)
+    last_activity = data.get("last_activity", "")
+    stuck = data.get("stuck_detected")
+
+    elapsed_str = f"{elapsed:.0f}s" if elapsed is not None else "unknown"
+    cpu_str = f"{cpu:.1f}%" if cpu is not None else "n/a"
+
+    pid = process.get("pid")
+    pid_alive = process.get("alive", False)
+    pid_str = f"PID {pid} ({'alive' if pid_alive else 'dead'})" if pid else "no active process"
+
+    header = [
+        f"Task:     {task_id}",
+        f"Status:   {status}",
+        f"Target:   {target}",
+        f"Elapsed:  {elapsed_str}",
+        f"CPU:      {cpu_str}",
+        f"Process:  {pid_str}",
+    ]
+    if last_activity:
+        header.append(f"Last act: {last_activity[:19].replace('T', ' ')}")
+    if stuck:
+        header.append(f"STUCK AT: {stuck}")
+    if is_container:
+        header.append(f"Container: YES | Vehicles: {', '.join(vehicle_ids) or 'none'}")
+    if remote_hint:
+        header.append(f"Note: {remote_hint}")
+    if data.get("error"):
+        header.append(f"Error: {data['error']}")
+
+    header.append(f"\n--- Log ({showing}/{total_lines} lines) ---")
+
+    if log_lines:
+        log_block = "\n".join(log_lines)
+    else:
+        log_block = "(no log output)"
+
+    return "\n".join(header) + "\n" + log_block
 
 
 if __name__ == "__main__":
