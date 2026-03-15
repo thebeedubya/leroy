@@ -16,7 +16,6 @@ Event-driven side effects:
 
 import json
 import logging
-import time
 
 from state_machine import TaskStateMachine, TaskState
 from failure_taxonomy import classify_failure, is_infra_failure
