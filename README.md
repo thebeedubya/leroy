@@ -1,104 +1,151 @@
 # Leroy
 
-Agent orchestration and SDLC enforcement for the FORGE compound intelligence ecosystem.
+Autonomous engineering lead for the FORGE ecosystem. Receives product specs, decomposes them into executable tasks, dispatches work to AI agents via Claude CLI, enforces a full SDLC with mandatory QA, and reports results back to the PM with full traceability.
 
-Named after Neil H. McElroy, father of product management (P&G, 1931). Also Leroy Jenkins energy: charge in and execute.
-
-## What Leroy Does
-
-Leroy sits between PM (Product Manager) and the engineering workforce. PM writes specs. Leroy decomposes them into tasks, assigns workforce agents, enforces a 15-step micro-sprint SDLC, runs mandatory QA, and reports results back to PM with budget tracking and acceptance criteria traceability.
+Named after Neil H. McElroy (father of product management at P&G, 1931) — with Leroy Jenkins energy.
 
 ## Architecture
 
 ```
-Brad (Operator)
-  |
-  v
-PM (CLI Claude -- this repo's CLAUDE.md)
-  - Strategy, specs, reviews, memory ownership
-  - Tools: forge-brain, A2A, web search
-  - Cannot execute code
-  |
-  v
-Leroy (Engineering Lead -- Claude Code, Architect pattern)
-  - Task decomposition, SDLC enforcement, workforce management
-  - Tools: all (bash, file edit, SSH, plus brain and A2A)
-  - Does NOT do deep implementation (delegates to workforce)
-  |
-  v
-Workforce (Subagents)
-  - Builders (implementation)
-  - QA (pytest + Playwright, mandatory)
-  - Evaluators (multi-candidate scoring)
-  - Specialists (domain-specific profiles)
+┌─────────────┐     spec      ┌──────────────────┐    Claude CLI    ┌───────────┐
+│  PM (Brad)  │──────────────▶│  Leroy A2A :9800 │────────────────▶│ Worktree  │
+│  via MCP    │◀──────────────│  Health    :9801  │◀────────────────│ Subprocess│
+└─────────────┘    results    └──────────────────┘    stdout/stderr └───────────┘
+                                      │
+                                      │ persist
+                                      ▼
+                               ┌──────────────┐
+                               │ forge-brain  │
+                               │ (Aianna)     │
+                               │ kush:8300    │
+                               └──────────────┘
 ```
 
-## Communication Protocol
+**Three layers:**
 
-PM and Leroy communicate via **A2A** (Google Agent-to-Agent protocol). A2A provides:
-- Task lifecycle: submitted -> working -> input_required -> completed/failed
-- Multi-turn conversations for escalation chains
-- Artifacts for deliverables (code, test results, budget reports)
-- Push notifications for decision gates
+1. **A2A Server** (port 9800) — Google's [Agent-to-Agent protocol](https://github.com/a2aproject/A2A) (Linux Foundation, Apache 2.0). Receives specs via JSON-RPC 2.0, manages task lifecycle, broadcasts state transitions.
+2. **Claude CLI Executor** — Spawns `claude -p` subprocesses in isolated git worktrees. Graduated timeouts (5m grace → 15m warn → 30m kill). Captures structured results.
+3. **MCP Client** — STDIO server that gives the PM 18 tools for spec submission, task management, messaging, analytics, and cost reporting.
 
-Both PM and Leroy use **Aianna** (forge-brain MCP) for persistent memory.
-
-## Repository Structure
+## Task Lifecycle
 
 ```
-leroy/
-  CLAUDE.md                 # PM persona (loads automatically in CLI)
-  README.md                 # This file
-  .claude/
-    settings.json           # MCP config (brain + A2A only for PM)
-  server/                   # Leroy A2A server (Python)
-  mcp/                      # MCP tool wrappers
-  personas/
-    pm.md                   # PM behavioral rules and knowledge
-    engineering_lead.md     # Leroy behavioral rules and SDLC
-    shared_context.md       # FORGE ecosystem context
-  sdlc/
-    micro_sprint.md         # 15-step sprint template
-    escalation.md           # Three-tier escalation rules
-    qa_requirements.md      # QA standards and test-first principle
-  app/                      # Future: native macOS PM app (SwiftUI)
-  docs/
-    architecture.md         # System architecture documentation
-    setup.md                # Setup and configuration guide
+NEW → ANALYZED → PLANNED → RUNNING → COMPLETED_UNVERIFIED → COMPLETED_VERIFIED → PERSISTED → ARCHIVED
+                              │
+                      FAILED_RETRYABLE → (retry or escalate)
+                              │
+                          ESCALATED
 ```
+
+State transitions enforced by a state machine. Each transition fires event handlers that trigger QA proposals, failure routing, persistence, and PM notifications.
+
+## Key Features
+
+- **Spec slicing** — Large specs auto-decomposed into parallel vehicles with dependency constraints
+- **Failure taxonomy** — Classifies failures (timeout, infra, scope, code error) and routes accordingly. Infrastructure failures bypass retry budget.
+- **Three-tier PM autonomy** — HIGH confidence: auto-execute. MEDIUM: propose + 30-min auto-approve. LOW: escalate to human. Tiers expand/contract based on outcomes.
+- **Knowledge governance** — Gate before persisting to brain: evaluates novelty, specificity, non-contradiction
+- **Circuit breaker** — Persistence to forge-brain uses circuit breaker with local queue on outage
+- **Concurrency control** — Priority queue with per-machine limits (haze: 3, kush: 1)
+- **Real-time observability** — SSE streaming for state transitions and live task logs
 
 ## Quick Start
 
-### Running as PM (no code execution)
 ```bash
-cd leroy
-claude  # CLAUDE.md loads automatically, restricts to PM role
+# Install dependencies
+cd server && pip install -r requirements.txt
+cd ../mcp && pip install -r requirements.txt
+
+# Set required env vars
+export FORGE_BRAIN_TOKEN="your-token"
+export FORGE_BRAIN_URL="http://kush.local:8300/mcp"
+
+# Run
+python server/start_server.py
+
+# Health check
+curl http://127.0.0.1:9801/health
 ```
 
-### Running as Engineering Lead (full tool access)
+Or via launchd (macOS):
 ```bash
-cd leroy
-claude --profile engineering-lead  # Different config, full tools
+cp server/com.forge.leroy-a2a.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.forge.leroy-a2a.plist
 ```
 
-## Status
+## Configuration
 
-- [x] PM persona and constraints (CLAUDE.md)
-- [x] Engineering Lead persona (personas/engineering_lead.md)
-- [x] Shared ecosystem context (personas/shared_context.md)
-- [x] Micro-sprint SDLC (sdlc/micro_sprint.md)
-- [x] Escalation rules (sdlc/escalation.md)
-- [x] QA requirements (sdlc/qa_requirements.md)
-- [ ] Leroy A2A server (server/)
-- [ ] PM-side A2A MCP tools (mcp/)
-- [ ] PM proxy guard (code execution blocker)
-- [ ] Native macOS PM app (app/)
-- [ ] Architecture documentation (docs/)
-- [ ] Setup guide (docs/)
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `LEROY_HOST` | 127.0.0.1 | Server bind address |
+| `LEROY_PORT` | 9800 | A2A server port |
+| `LEROY_HEALTH_PORT` | 9801 | Health check port |
+| `LEROY_TASK_DB_PATH` | data/tasks.db | SQLite database |
+| `FORGE_BRAIN_URL` | http://kush.local:8300/mcp | Aianna endpoint |
+| `FORGE_BRAIN_TOKEN` | (empty) | Auth token for forge-brain |
+| `LEROY_TASK_TIMEOUT` | 3600 | Max task runtime (seconds) |
+| `LEROY_MAX_CONCURRENT_HAZE` | 3 | Concurrent task limit |
 
-## Build Order
+## MCP Tools (PM Interface)
 
-1. **A2A server** -- Leroy's brain. Task lifecycle, SDLC state machine, workforce dispatch.
-2. **MCP tools** -- Thin A2A client wrappers so PM and Code can talk to the server.
-3. **Proxy guard** -- Hard blocker preventing PM sessions from executing code.
-4. **Native macOS app** -- SwiftUI wrapper around CLI with Agent SDK. Xcode 26.3.
+| Tool | Purpose |
+|------|---------|
+| `leroy_send_spec` | Submit a spec for execution |
+| `leroy_check_task` | Get full task status and result |
+| `leroy_list_tasks` | Query tasks by status |
+| `leroy_cancel_task` | Cancel a pending/running task |
+| `leroy_read_messages` | Poll for pending PM messages |
+| `leroy_reply_to_message` | Respond to decision gates |
+| `leroy_tail_task` | Stream live task logs |
+| `leroy_cost_report` | Token usage breakdown |
+| `leroy_subsystem_health` | Per-subsystem pass rates |
+| `leroy_plan_report` | Plan completion statistics |
+
+## Project Structure
+
+```
+leroy/
+├── server/
+│   ├── server.py              # Entry point, route table, initialization
+│   ├── execution.py           # Claude CLI subprocess executor
+│   ├── server_state.py        # Shared state, broadcast helpers, auth
+│   ├── config.py              # Environment-based configuration
+│   ├── state_machine.py       # Task state machine (10 states)
+│   ├── task_db.py             # SQLite persistence (WAL mode)
+│   ├── retry_budget.py        # Retry limits with infra bypass
+│   ├── failure_taxonomy.py    # Failure classification
+│   ├── dispatcher.py          # Spec slicing into vehicles
+│   ├── container_store.py     # Vehicle container persistence
+│   ├── task_queue.py          # Priority queue with concurrency
+│   ├── pm_autonomy.py         # Three-tier decision confidence
+│   ├── task_events.py         # Event handlers on transitions
+│   ├── persist_manager.py     # Async brain persistence + circuit breaker
+│   ├── agent_bus.py           # Agent-to-agent messaging
+│   ├── task_analytics.py      # Scoring and validation
+│   ├── knowledge_governance.py# Pre-persist quality gate
+│   ├── routes_tasks.py        # Task CRUD endpoints
+│   ├── routes_messages.py     # PM messaging endpoints
+│   ├── routes_ops.py          # Ops, agents, proposals, plans
+│   └── routes_admin.py        # Health, circuit breaker, hooks
+├── mcp/
+│   ├── leroy_client.py        # MCP STDIO server (PM tools)
+│   └── requirements.txt
+├── data/
+│   └── tasks.db               # SQLite task database
+└── content/
+    └── logs/                  # Task logs, persist queue
+```
+
+## Dependencies
+
+**Server:** `a2a-sdk[http-server]`, `uvicorn`, `starlette`, `httpx`, `mcp[cli]`
+
+**MCP Client:** `fastmcp`, `httpx`
+
+## Part of FORGE
+
+Leroy is one component of the [FORGE ecosystem](https://github.com/thebeedubya/forge-ecosystem) — an AI-native development platform where agents communicate via Google's A2A protocol and persist knowledge to a shared brain (Qdrant + Neo4j + PostgreSQL).
+
+## License
+
+MIT
