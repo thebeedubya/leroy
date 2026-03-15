@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>AROYA Slide</title>
+<link href="https://fonts.googleapis.com" rel="preconnect"/>
+<link href="https://fonts.gstatic.com" rel="preconnect" crossorigin="anonymous"/>
+<link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@300;400;600;700;800;900&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg-main: #111111;
+    --bg-card: #1a1c19;
+    --text-main: #ffffff;
+    --text-muted: #aaaaaa;
+    --aroya-green: #b7d89e;
+    --border-color: #333333;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    font-family: 'Montserrat', sans-serif;
+    background: var(--bg-main);
+    color: var(--text-main);
+    width: 960px;
+    height: 540px;
+    overflow: hidden;
+  }
+
+  /* 16:9 slide frame */
+  .slide {
+    width: 960px;
+    height: 540px;
+    position: relative;
+    overflow: hidden;
+    background-color: var(--bg-main);
+    background-image:
+      linear-gradient(rgba(255,255,255,0.02) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,0.02) 1px, transparent 1px);
+    background-size: 40px 40px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 40px;
+  }
+
+  /* ── Content card ── */
+  .content-box {
+    width: 100%;
+    background: var(--bg-card);
+    border: 1px solid var(--border-color);
+    border-radius: 16px;
+    padding: 48px 52px;
+    box-shadow: 0 16px 48px rgba(0,0,0,0.5);
+  }
+  .slide.no-card {
+    padding: 60px 72px;
+    align-items: flex-start;
+    justify-content: center;
+    flex-direction: column;
+  }
+  .slide.no-card.centered {
+    align-items: center;
+    text-align: center;
+  }
+
+  /* ── Logo ── */
+  .aroya-logo {
+    position: absolute;
+    top: 28px;
+    left: 36px;
+    height: 28px;
+    width: auto;
+    fill: white;
+    opacity: 0.7;
+    z-index: 10;
+  }
+
+  /* ── Persona badge ── */
+  .badge {
+    position: absolute;
+    top: 28px;
+    right: 36px;
+    font-size: 9px;
+    font-weight: 800;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    padding: 5px 14px;
+    border-radius: 3px;
+    z-index: 10;
+    background: rgba(183, 216, 158, 0.1);
+    color: var(--aroya-green);
+    border: 1px solid rgba(183, 216, 158, 0.2);
+  }
+
+  /* ── Progress bar ── */
+  .progress-bar {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    height: 3px;
+    background: var(--aroya-green);
+    z-index: 10;
+  }
+
+  /* ── Page number ── */
+  .pagenum {
+    position: absolute;
+    bottom: 20px;
+    right: 36px;
+    font-size: 11px;
+    font-weight: 600;
+    color: #444;
+    z-index: 10;
+  }
+
+  /* ── Typography ── */
+  .tag {
+    font-size: 0.75rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    color: var(--aroya-green);
+    margin-bottom: 14px;
+    display: block;
+  }
+  h1 {
+    font-size: 3.2rem;
+    font-weight: 700;
+    letter-spacing: -0.5px;
+    color: var(--text-main);
+    line-height: 1.1;
+    margin-bottom: 16px;
+  }
+  h2 {
+    font-size: 1.8rem;
+    font-weight: 700;
+    letter-spacing: -0.3px;
+    color: var(--text-main);
+    line-height: 1.15;
+    margin-bottom: 18px;
+  }
+  p, li {
+    font-size: 1rem;
+    line-height: 1.6;
+    color: var(--text-muted);
+    font-weight: 400;
+  }
+  p { margin-bottom: 12px; }
+  ul { padding-left: 1.5rem; list-style: none; }
+  li { margin-bottom: 14px; position: relative; padding-left: 16px; }
+  li::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 10px;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--aroya-green);
+  }
+  .highlight { color: var(--aroya-green); font-weight: 700; }
+
+  /* ── Stat grid ── */
+  .stat-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    margin-top: 24px;
+  }
+  .stat-box {
+    background: rgba(255,255,255,0.03);
+    border: 1px solid var(--border-color);
+    border-left: 4px solid var(--aroya-green);
+    padding: 20px;
+    border-radius: 8px;
+  }
+  .stat-num {
+    font-size: 2rem;
+    font-weight: 800;
+    color: white;
+    line-height: 1;
+    margin-bottom: 6px;
+  }
+  .stat-label {
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    font-weight: 600;
+    letter-spacing: 1px;
+  }
+
+  /* ── Two-column ── */
+  .columns { display: flex; gap: 32px; margin-top: 8px; }
+  .col { flex: 1; }
+  .col-header {
+    font-size: 0.7rem;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    color: var(--aroya-green);
+    margin-bottom: 14px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--border-color);
+  }
+  .col li { font-size: 0.9rem; margin-bottom: 10px; }
+
+  /* ── Checklist cards ── */
+  .checks { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+  .check-row {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    background: rgba(255,255,255,0.03);
+    border: 1px solid var(--border-color);
+    border-left: 4px solid var(--aroya-green);
+    padding: 12px 18px;
+    border-radius: 8px;
+  }
+  .check-box {
+    width: 18px;
+    height: 18px;
+    border: 2px solid var(--aroya-green);
+    border-radius: 3px;
+    flex-shrink: 0;
+    opacity: 0.5;
+  }
+  .check-text { font-size: 0.9rem; color: var(--text-muted); }
+  .check-text strong { color: var(--text-main); font-weight: 700; }
+
+  /* ── Quote ── */
+  .quote-mark {
+    font-size: 4rem;
+    font-weight: 800;
+    color: var(--aroya-green);
+    opacity: 0.4;
+    line-height: 0.5;
+    margin-bottom: 20px;
+  }
+  blockquote {
+    font-size: 1.4rem;
+    font-weight: 500;
+    color: var(--text-main);
+    line-height: 1.5;
+    font-style: italic;
+    margin-bottom: 16px;
+  }
+  .attribution {
+    font-size: 0.8rem;
+    font-weight: 700;
+    color: var(--aroya-green);
+    letter-spacing: 1px;
+    text-transform: uppercase;
+  }
+
+  /* ── Subtitle line (title slide) ── */
+  .subtitle-line {
+    font-size: 0.8rem;
+    color: #666;
+    text-transform: uppercase;
+    font-weight: 600;
+    letter-spacing: 1.5px;
+    margin-top: 28px;
+  }
+</style>
+</head>
+<body>
+
+<!-- AROYA SVG logo symbol — inline, shared by all layouts -->
+<svg xmlns="http://www.w3.org/2000/svg" style="display:none">
+  <symbol id="aroya-logo" viewBox="0 0 202.1 75">
+    <path d="M83.7,45.3c10.2,0,15.9-7.3,15.9-17.4s-5.6-17.4-15.9-17.4-16,7.2-16,17.4,5.8,17.4,16,17.4ZM75.2,17.9c1.4-1.9,4.3-3.6,8.7-3.6s6.5,1.3,8.2,3.8c1.7,2.4,2.6,5.5,2.6,9.9s-.9,7.5-2.6,9.9c-1.7,2.5-4.4,3.8-8.4,3.8s-6.8-1.3-8.7-3.8c-1.3-1.7-2.4-5.2-2.4-9.9s.9-7.9,2.5-10.1Z"/>
+    <path d="M18.6,11.1L5.4,44.8h4.6l3.7-10.1h14.3l3.8,10.1h4.6L23.2,11.1h-4.6ZM15.2,30.9l3.8-10.1c.8-2.1,1.3-3.7,1.9-5.4h0c.5,1.4,1.3,3.7,1.9,5.4l3.8,10.1h-11.4Z"/>
+    <path d="m148.7 44.8h4.6l-13.1-33.7h-4.6l-13.2 33.7h4.6l3.7-10.1h14.3l3.8 10.1zm-16.6-13.9 3.8-10.1c0.8-2.1 1.3-3.7 1.9-5.4 0.5 1.4 1.3 3.7 1.9 5.4l3.8 10.1h-11.4z"/>
+    <path d="m59.1 29.2c2.9-1 5.2-4.1 5.2-8.2 0-9.1-7.3-9.9-13.3-9.9h-11.4v33.7h4.3v-14h7.5c5.9 0 7.7 1.3 7.7 6s0.3 6.3 1.4 7.9h4.8s0-0.2 0-0.2c-1.6-2.1-1.9-4.4-1.9-8.3s-1.2-5.9-4.4-7.1zm-8.2-2.1h-7v-12.3h7.1c4.1 0 9 0 9 6.3 0 5.6-4.9 5.9-9 5.9z"/>
+    <path d="m122.1 11.1-5.7 9.6c-1.1 1.8-2.1 3.7-3.5 6.2-1.2-2.3-3.2-5.6-3.5-6.2l-5.7-9.6h-5l12.1 19.3v14.4h4.4v-14.4l12.1-19.3h-5.1z"/>
+    <rect x="127.4" y="57.2" width="1.8" height="9.9"/>
+    <path d="M138,62.8c0,2.1-.9,3.1-2.6,3.1s-.7,0-1,0c-.3-.1-.5-.3-.8-.5-.2-.2-.3-.4-.4-.6-.1-.2-.2-.5-.2-.7v-6.8h-1.9v7.2c0,.3.1.7.2,1,0,.4.3.6.5.9.4.3.8.6,1.3.8s1.1.3,1.8.2c.7,0,1.4-.1,1.9-.4s.9-.7,1.2-1.3v1.5h1.8v-9.9h-1.8v5.6Z"/>
+    <path d="M152.7,57c-.6,0-1,.1-1.4.2-.4.1-.7.3-1,.6-.2.2-.4.4-.6.6s-.3.5-.4.7c-.2-.7-.6-1.2-1.2-1.6-.5-.4-1.2-.6-2-.6s-1.7.3-2.3.8c-.3.3-.6.6-.7,1v-1.5h-1.6v9.9h1.8v-5.5c0-.7.1-1.3.2-1.7.2-.4.4-.7.7-1,.4-.4.9-.5,1.5-.5s.6,0,.9,0c.3.1.6.2.8.5.2.2.3.4.4.6,0,.2.1.5.1.7v6.8h1.8v-6.4c0-1.2-.3-2.2-.9-2.8-.6-.6-1.4-.9-2.6-.9Z"/>
+    <path d="M112.7,58.5c-.7-1-1.8-1.5-3.2-1.5s-1.7.2-2.4.6c-.7.4-1.2,1-1.6,1.8-.3.8-.5,1.7-.5,2.8s.2,1.9.6,2.7c.4.8.9,1.4,1.6,1.8.7.4,1.5.6,2.4.6s1.3-.1,1.8-.4,1-.7,1.3-1.3v1.5h1.8v-13.9h-1.8v5.3ZM112.1,65c-.5.6-1.2,1-2.1,1s-1.3-.2-1.8-.5c-.5-.3-.8-.7-1-1.3-.2-.6-.3-1.2-.3-2.1,0-1.3.2-2.2.7-2.8.5-.6,1.2-.9,2.3-.9s1.8.4,2.2,1.1c.5.6.7,1.5.7,2.7s-.2,2.2-.7,2.8Z"/>
+    <rect x="127.4" y="53.2" width="1.8" height="1.8"/>
+    <path d="M123.8,58.5c-.7-1-1.8-1.5-3.2-1.5s-1.7.2-2.4.6c-.7.4-1.2,1-1.6,1.8-.4.8-.6,1.6-.6,2.7s.2,2,.6,2.8c.4.8.9,1.4,1.6,1.8.7.5,1.4.7,2.5.6.7,0,1.3-.1,1.8-.4s.9-.7,1.3-1.3v1.5h1.8v-13.9h-1.8v5.3ZM123,65c-.5.6-1.2,1-2.1,1s-1.4-.2-1.8-.5c-.4-.3-.7-.7-.9-1.3-.2-.6-.3-1.3-.3-2.1,0-1.2.2-2.2.7-2.8.5-.6,1.2-.9,2.3-.9s1.8.4,2.2,1.1c.4.7.6,1.6.6,2.7s-.2,2.2-.7,2.8Z"/>
+    <path d="M97.7,53.2l-5.5,13.9h1.9l1.5-4.2h5.9l1.6,4.2h1.9l-5.4-13.9h-1.9ZM96.2,61.4l1.6-4.2c.4-.9.6-1.7.8-2.2.3.8.6,1.5.8,2.2l1.6,4.2h-4.8Z"/>
+    <path d="M85.4,62.4c-.2.7-.5,1.6-.9,2.6-.4-1.1-.6-2-.9-2.6l-1.9-5.3h-1.9l3.9,9.8c-.3.6-.5,1.1-.6,1.4,0,.3-.3.5-.5.7-.2.2-.4.3-.6.3-.4,0-.8-.1-1.2-.2v1.6c.5.1,1,.2,1.5.2s.8,0,1.2-.3c.3-.2.6-.5.9-1,.3-.4.5-1,.8-1.8l4-10.8h-1.9l-1.9,5.4Z"/>
+    <path d="M77.5,57.5c-.7-.4-1.5-.7-2.3-.7-1.4,0-2.4.5-3.2,1.6v-5.3h-1.8v13.9h1.8v-1.4c.4.5.8.9,1.4,1.2.5.3,1.1.4,1.8.4s1.7-.2,2.3-.6c.7-.4,1.2-1,1.6-1.8.4-.8.6-1.7.6-2.8s-.2-1.9-.6-2.7c-.4-.8-.9-1.4-1.6-1.8ZM77.5,64.1c-.2.6-.5,1-.9,1.3-.4.3-1,.5-1.8.5s-1.7-.3-2.1-1c-.5-.6-.7-1.6-.7-2.8s.2-2,.6-2.8c.3-.7,1.1-1.1,2.2-1.1s1.8.3,2.3,1c.5.6.7,1.6.7,2.8s0,1.5-.3,2.1Z"/>
+    <path d="m185.8 9v9.9c0 1.2-1 2.1-2.1 2.1h-21.9v12h9.9c1.2 0 2.1 1 2.1 2.1v9.9h12v-21.9c0-1.2 1-2.1 2.1-2.1h9.9v-12h-12z"/>
+  </symbol>
+</svg>
+
+<!-- ============================================================
+     LAYOUT: title
+     Tokens: {{TAG}}, {{TITLE}}, {{BODY}}, {{SUBTITLE}},
+             {{BADGE}}, {{PAGENUM}}, {{PROGRESS_WIDTH}}
+     No card. Tag + large h1 + p subtitle + subtitle-line.
+     Use for module opener / first slide.
+============================================================ -->
+<!-- LAYOUT_START:title -->
+<div class="slide no-card">
+  <svg class="aroya-logo"><use href="#aroya-logo"/></svg>
+  <span class="badge">{{BADGE}}</span>
+  <span class="pagenum">{{PAGENUM}}</span>
+  <div class="progress-bar" style="width:{{PROGRESS_WIDTH}}"></div>
+  <span class="tag">{{TAG}}</span>
+  <h1>{{TITLE}}</h1>
+  <p>{{BODY}}</p>
+  <div class="subtitle-line">{{SUBTITLE}}</div>
+</div>
+<!-- LAYOUT_END:title -->
+
+<!-- ============================================================
+     LAYOUT: bullet
+     Tokens: {{TAG}}, {{TITLE}}, {{BODY}},
+             {{BADGE}}, {{PAGENUM}}, {{PROGRESS_WIDTH}}
+     Card. Tag + h2 + ul block.
+     {{BODY}} = one or more <li>...</li> elements.
+     Python wraps them in <ul>...</ul> automatically.
+============================================================ -->
+<!-- LAYOUT_START:bullet -->
+<div class="slide">
+  <svg class="aroya-logo"><use href="#aroya-logo"/></svg>
+  <span class="badge">{{BADGE}}</span>
+  <span class="pagenum">{{PAGENUM}}</span>
+  <div class="progress-bar" style="width:{{PROGRESS_WIDTH}}"></div>
+  <div class="content-box">
+    <span class="tag">{{TAG}}</span>
+    <h2>{{TITLE}}</h2>
+    <ul>{{BODY}}</ul>
+  </div>
+</div>
+<!-- LAYOUT_END:bullet -->
+
+<!-- ============================================================
+     LAYOUT: two-column
+     Tokens: {{TAG}}, {{TITLE}},
+             {{COL1_HEADER}}, {{COL1_BODY}},
+             {{COL2_HEADER}}, {{COL2_BODY}},
+             {{BADGE}}, {{PAGENUM}}, {{PROGRESS_WIDTH}}
+     Card. Tag + h2 + two columns side by side.
+     {{COL1_BODY}} / {{COL2_BODY}} = <li>...</li> elements.
+============================================================ -->
+<!-- LAYOUT_START:two-column -->
+<div class="slide">
+  <svg class="aroya-logo"><use href="#aroya-logo"/></svg>
+  <span class="badge">{{BADGE}}</span>
+  <span class="pagenum">{{PAGENUM}}</span>
+  <div class="progress-bar" style="width:{{PROGRESS_WIDTH}}"></div>
+  <div class="content-box">
+    <span class="tag">{{TAG}}</span>
+    <h2>{{TITLE}}</h2>
+    <div class="columns">
+      <div class="col">
+        <div class="col-header">{{COL1_HEADER}}</div>
+        <ul>{{COL1_BODY}}</ul>
+      </div>
+      <div class="col">
+        <div class="col-header">{{COL2_HEADER}}</div>
+        <ul>{{COL2_BODY}}</ul>
+      </div>
+    </div>
+  </div>
+</div>
+<!-- LAYOUT_END:two-column -->
+
+<!-- ============================================================
+     LAYOUT: stat-grid
+     Tokens: {{TAG}}, {{TITLE}}, {{BODY}}, {{STATS}},
+             {{BADGE}}, {{PAGENUM}}, {{PROGRESS_WIDTH}}
+     Card. Tag + h2 + optional intro p + 2x2 stat grid.
+     {{BODY}} = intro paragraph text (can be empty string).
+     {{STATS}} = four <div class="stat-box">...</div> blocks.
+     Each stat-box contains .stat-num and .stat-label.
+============================================================ -->
+<!-- LAYOUT_START:stat-grid -->
+<div class="slide">
+  <svg class="aroya-logo"><use href="#aroya-logo"/></svg>
+  <span class="badge">{{BADGE}}</span>
+  <span class="pagenum">{{PAGENUM}}</span>
+  <div class="progress-bar" style="width:{{PROGRESS_WIDTH}}"></div>
+  <div class="content-box">
+    <span class="tag">{{TAG}}</span>
+    <h2>{{TITLE}}</h2>
+    <p>{{BODY}}</p>
+    <div class="stat-grid">{{STATS}}</div>
+  </div>
+</div>
+<!-- LAYOUT_END:stat-grid -->
+
+<!-- ============================================================
+     LAYOUT: section-divider
+     Tokens: {{TAG}}, {{TITLE}}, {{BODY}},
+             {{BADGE}}, {{PAGENUM}}, {{PROGRESS_WIDTH}}
+     No card. Tag + h2 + p description.
+     Use between major topic sections.
+============================================================ -->
+<!-- LAYOUT_START:section-divider -->
+<div class="slide no-card">
+  <svg class="aroya-logo"><use href="#aroya-logo"/></svg>
+  <span class="badge">{{BADGE}}</span>
+  <span class="pagenum">{{PAGENUM}}</span>
+  <div class="progress-bar" style="width:{{PROGRESS_WIDTH}}"></div>
+  <span class="tag">{{TAG}}</span>
+  <h2>{{TITLE}}</h2>
+  <p>{{BODY}}</p>
+</div>
+<!-- LAYOUT_END:section-divider -->
+
+<!-- ============================================================
+     LAYOUT: checklist
+     Tokens: {{TAG}}, {{TITLE}}, {{CHECKS}},
+             {{BADGE}}, {{PAGENUM}}, {{PROGRESS_WIDTH}}
+     Card. Tag + h2 + checklist rows.
+     {{CHECKS}} = one or more <div class="check-row">...</div> blocks.
+     Each check-row contains .check-box and .check-text.
+============================================================ -->
+<!-- LAYOUT_START:checklist -->
+<div class="slide">
+  <svg class="aroya-logo"><use href="#aroya-logo"/></svg>
+  <span class="badge">{{BADGE}}</span>
+  <span class="pagenum">{{PAGENUM}}</span>
+  <div class="progress-bar" style="width:{{PROGRESS_WIDTH}}"></div>
+  <div class="content-box">
+    <span class="tag">{{TAG}}</span>
+    <h2>{{TITLE}}</h2>
+    <div class="checks">{{CHECKS}}</div>
+  </div>
+</div>
+<!-- LAYOUT_END:checklist -->
+
+<!-- ============================================================
+     LAYOUT: quote
+     Tokens: {{QUOTE}}, {{ATTRIBUTION}},
+             {{BADGE}}, {{PAGENUM}}, {{PROGRESS_WIDTH}}
+     No card, centered. Decorative quote mark + blockquote + attribution.
+     Use for closing slides, key principle callouts.
+============================================================ -->
+<!-- LAYOUT_START:quote -->
+<div class="slide no-card centered">
+  <svg class="aroya-logo"><use href="#aroya-logo"/></svg>
+  <span class="badge">{{BADGE}}</span>
+  <span class="pagenum">{{PAGENUM}}</span>
+  <div class="progress-bar" style="width:{{PROGRESS_WIDTH}}"></div>
+  <div class="quote-mark">"</div>
+  <blockquote>{{QUOTE}}</blockquote>
+  <div class="attribution">{{ATTRIBUTION}}</div>
+</div>
+<!-- LAYOUT_END:quote -->
+
+</body>
+</html>

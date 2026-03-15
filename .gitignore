@@ -19,3 +19,11 @@ logs/
 specs/
 .secrets*
 .env.*
+
+# Runtime / generated
+.claude/worktrees/
+.next/
+test-results/
+content/training/output/
+content/data/
+content/dashboard/dist/

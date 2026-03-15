@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Launchd watchdog for the Kush worker process.
+         Install: cp com.leroy.kush-worker.plist ~/Library/LaunchAgents/
+         Load:    launchctl load ~/Library/LaunchAgents/com.leroy.kush-worker.plist
+         Unload:  launchctl unload ~/Library/LaunchAgents/com.leroy.kush-worker.plist
+         Status:  launchctl list | grep leroy
+         Health:  curl http://127.0.0.1:9815/health
+    -->
+
+    <key>Label</key>
+    <string>com.leroy.kush-worker</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/python3</string>
+        <string>/Users/brad.wood/Projects/leroy/server/kush_worker.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/brad.wood/Projects/leroy/server</string>
+
+    <!-- Environment variables. Set LEROY_A2A_TOKEN to the real token value. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>/Users/brad.wood</string>
+        <key>LEROY_A2A_URL</key>
+        <string>http://ADM-MSHA-80085.local:9800</string>
+        <key>LEROY_A2A_TOKEN</key>
+        <string>REPLACE_WITH_REAL_TOKEN</string>
+        <key>POLL_INTERVAL</key>
+        <string>30</string>
+        <key>OPS_AGENT_DIR</key>
+        <string>/Users/brad.wood/Projects/ops-agent</string>
+        <key>CLAUDE_BIN</key>
+        <string>/opt/homebrew/bin/claude</string>
+        <key>MAX_TURNS</key>
+        <string>50</string>
+        <key>INACTIVITY_TIMEOUT</key>
+        <string>600</string>
+        <key>HEALTH_PORT</key>
+        <string>9815</string>
+    </dict>
+
+    <!-- Restart immediately if the process exits for any reason -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Wait 10 seconds before restarting after a crash -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- Launch at login -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Stdout/stderr captured to log files -->
+    <key>StandardOutPath</key>
+    <string>/Users/brad.wood/Projects/leroy/logs/kush-worker.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/brad.wood/Projects/leroy/logs/kush-worker.err.log</string>
+</dict>
+</plist>

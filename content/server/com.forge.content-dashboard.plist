@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.forge.content-dashboard</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/brad.wood/Projects/leroy/content/server/.venv/bin/python</string>
+        <string>/Users/brad.wood/Projects/leroy/content/server/content_server.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/brad.wood/Projects/leroy/content/server</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/brad.wood/Library/Logs/content-dashboard.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/brad.wood/Library/Logs/content-dashboard.err</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>CONTENT_HOST</key>
+        <string>127.0.0.1</string>
+        <key>CONTENT_PORT</key>
+        <string>9810</string>
+        <key>CONTENT_WORK_DIR</key>
+        <string>/Users/brad.wood/Projects/leroy/content</string>
+        <key>CONTENT_DB_PATH</key>
+        <string>/Users/brad.wood/Projects/leroy/content/data/content.db</string>
+        <key>PATH</key>
+        <string>/Users/brad.wood/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>

@@ -1,0 +1,73 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', ui-monospace, monospace;
+  background-color: #080b12;
+  color: #e2e8f0;
+  margin: 0;
+  padding: 0;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #0f1420;
+}
+::-webkit-scrollbar-thumb {
+  background: #2a3347;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #3b4a63;
+}
+
+/* Markdown prose overrides */
+.prose-content {
+  color: #e2e8f0;
+  line-height: 1.6;
+}
+.prose-content h1,
+.prose-content h2,
+.prose-content h3 {
+  color: #f1f5f9;
+  margin-top: 1.2em;
+  margin-bottom: 0.5em;
+}
+.prose-content p {
+  margin-bottom: 0.8em;
+}
+.prose-content ul,
+.prose-content ol {
+  padding-left: 1.5em;
+  margin-bottom: 0.8em;
+}
+.prose-content a {
+  color: #3b82f6;
+}
+.prose-content code {
+  background: #1e2535;
+  padding: 0.1em 0.3em;
+  border-radius: 3px;
+  font-size: 0.9em;
+}
+.prose-content pre {
+  background: #1e2535;
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+}
+.prose-content blockquote {
+  border-left: 3px solid #334155;
+  padding-left: 1em;
+  color: #94a3b8;
+  margin: 0.8em 0;
+}
