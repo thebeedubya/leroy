@@ -44,12 +44,18 @@ class Dispatcher:
     of the same container's vehicle list and dependency graph.
     """
 
-    def __init__(self, container_store, task_queue, task_meta, state_machine):
+    # Machines where the A2A server runs locally and can use the in-process task queue.
+    # All other targets are remote -- vehicles stay as 'pending' for remote workers to poll.
+    LOCAL_MACHINES = {"haze"}
+
+    def __init__(self, container_store, task_queue, task_meta, state_machine,
+                 broadcast_fn=None):
         self._store = container_store        # ContainerStore instance
         self._queue = task_queue             # TaskQueue instance
         self._meta = task_meta               # PersistentTaskDict
         self._sm = state_machine             # TaskStateMachine
         self._locks: dict[str, threading.Lock] = {}  # per-container locks (IC-7)
+        self._broadcast_fn = broadcast_fn    # Optional: _broadcast_task_update_sync from server.py
 
     # ------------------------------------------------------------------
     # Lock management (IC-7)
@@ -60,6 +66,36 @@ class Dispatcher:
         if container_id not in self._locks:
             self._locks[container_id] = threading.Lock()
         return self._locks[container_id]
+
+    # ------------------------------------------------------------------
+    # Target-aware vehicle activation
+    # ------------------------------------------------------------------
+
+    def _make_vehicle_runnable(self, vid: str, spec: str, target: str,
+                                priority: str = "normal") -> None:
+        """Make a vehicle runnable: enqueue locally or set pending for remote worker.
+
+        Local machines (haze): push into the in-process TaskQueue for immediate execution.
+        Remote machines (kush, halo, studio, etc.): set status to 'pending' in task_meta
+        so the remote worker can poll GET /tasks?status=pending&target=<machine> and pick it up.
+        """
+        if target in self.LOCAL_MACHINES:
+            self._queue.enqueue(vid, spec, priority=priority, target_machine=target)
+        else:
+            # Remote: flip status to pending for worker polling
+            if vid in self._meta:
+                meta = dict(self._meta[vid])
+                meta["status"] = "pending"
+                self._meta[vid] = meta
+                logger.info(
+                    "Dispatcher: vehicle %s set pending for remote worker (target=%s)",
+                    vid[:8], target,
+                )
+                if self._broadcast_fn:
+                    try:
+                        self._broadcast_fn(vid)
+                    except Exception:
+                        pass
 
     # ------------------------------------------------------------------
     # Threshold gate
@@ -137,15 +173,20 @@ class Dispatcher:
                 vehicle_task_id = str(uuid.uuid4())
                 index_to_task_id[vehicle.vehicle_index] = vehicle_task_id
 
+                # Vehicles with deps start as 'blocked' to prevent remote workers
+                # from picking them up before dependencies complete.
+                # Vehicles with no deps start as 'pending' (ready to run).
+                has_deps = bool(vehicle.depends_on)
                 self._meta[vehicle_task_id] = {
                     "task_id": vehicle_task_id,
                     "spec": vehicle.spec_text,
-                    "status": "pending",
+                    "status": "blocked" if has_deps else "pending",
                     "result": None,
                     "created_at": datetime.now(timezone.utc).isoformat(),
                     "completed_at": None,
                     "parent_id": container_id,
                     "vehicle_index": vehicle.vehicle_index,
+                    "target": target_machine,
                     "builder_prompt_version": self._meta.get(task_id, {}).get(
                         "builder_prompt_version", ""
                     ),
@@ -196,16 +237,12 @@ class Dispatcher:
                 vehicle_spec = next(
                     v for v in vehicles if index_to_task_id[v.vehicle_index] == vid
                 )
-                self._queue.enqueue(
-                    vid,
-                    vehicle_spec.spec_text,
-                    priority=priority,
-                    target_machine=target_machine,
+                self._make_vehicle_runnable(
+                    vid, vehicle_spec.spec_text, target_machine, priority=priority,
                 )
                 logger.info(
-                    "Dispatcher: enqueued ready vehicle %s (container %s)",
-                    vid,
-                    container_id,
+                    "Dispatcher: ready vehicle %s activated (target=%s, container %s)",
+                    vid, target_machine, container_id,
                 )
 
             # Step 8: Store pending vehicles
@@ -335,21 +372,15 @@ class Dispatcher:
                         break
 
                 if all_deps_done:
-                    # Enqueue this vehicle
+                    # Activate this vehicle on its target machine
                     vid_meta = self._meta.get(vid) or {}
                     vid_spec = vid_meta.get("spec", "")
-                    # Use container priority (stored as int 1 = "normal")
-                    self._queue.enqueue(
-                        vid,
-                        vid_spec,
-                        priority="normal",
-                        target_machine="haze",
-                    )
+                    vid_target = vid_meta.get("target", "haze")
+                    self._make_vehicle_runnable(vid, vid_spec, vid_target)
                     newly_enqueued.append(vid)
                     logger.info(
-                        "Dispatcher: unblocked vehicle %s in container %s (deps satisfied)",
-                        vid,
-                        container_id,
+                        "Dispatcher: unblocked vehicle %s in container %s (target=%s, deps satisfied)",
+                        vid, container_id, vid_target,
                     )
 
             # Remove newly enqueued from pending list
@@ -408,14 +439,28 @@ class Dispatcher:
                 for r in results
                 if r["state"] in ("FAILED_RETRYABLE", "ESCALATED", "BLOCKED")
             ]
+            failure_summary = (
+                f"Reconvergence blocked: {len(failed_vids)} vehicle(s) failed: {failed_vids}"
+            )
             logger.warning(
                 "Reconvergence blocked: container %s has %d failed vehicles: %s",
                 container_id[:8],
                 len(failed_vids),
                 failed_vids,
             )
+            # Gap 1: Promote parent task to failed so dashboard reflects reality
+            parent_meta = self._meta.get(container_id) or {}
+            parent_meta["status"] = "failed"
+            parent_meta["result"] = failure_summary
+            parent_meta["completed_at"] = datetime.now(timezone.utc).isoformat()
+            self._meta[container_id] = parent_meta
+            if self._broadcast_fn:
+                try:
+                    self._broadcast_fn(container_id)
+                except Exception as _be:
+                    logger.warning("Reconvergence: broadcast failed: %s", _be)
             try:
-                from agent_bus import agent_bus  # noqa: PLC0415
+                import agent_bus  # noqa: PLC0415
                 agent_bus.send({
                     "from": "leroy",
                     "to": "pm",
@@ -430,7 +475,7 @@ class Dispatcher:
                 })
             except Exception as e:
                 logger.warning("Reconvergence: failed to notify PM: %s", e)
-            print("RECONVERGE: blocked -- NEEDS_DECISION set", flush=True)
+            print("RECONVERGE: blocked -- NEEDS_DECISION set, parent task marked failed", flush=True)
             return
 
         # All vehicles passed -- aggregate metrics
@@ -467,6 +512,105 @@ class Dispatcher:
             flush=True,
         )
 
+        # Gap 2: Git merge for parallel vehicles with worktrees
+        # Runs BEFORE marking container COMPLETED (spec requirement)
+        vehicles_with_worktrees = []
+        for r in results:
+            vmeta = self._meta.get(r["task_id"]) or {}
+            wp = vmeta.get("worktree_path")
+            branch = vmeta.get("worktree_branch")
+            if wp and branch and os.path.exists(wp):
+                vehicles_with_worktrees.append({
+                    "vehicle_index": r["vehicle_index"],
+                    "task_id": r["task_id"],
+                    "worktree_path": wp,
+                    "branch": branch,
+                })
+
+        if vehicles_with_worktrees:
+            import subprocess  # noqa: PLC0415
+            vehicles_with_worktrees.sort(key=lambda v: v["vehicle_index"])
+            repo_root = str(Path(__file__).parent.parent)
+            merge_errors = []
+            merged_paths: list[str] = []
+
+            for v in vehicles_with_worktrees:
+                merge_result = subprocess.run(
+                    [
+                        "git", "merge", "--no-ff", v["branch"],
+                        "-m", f"Merge vehicle {v['vehicle_index']}",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    cwd=repo_root,
+                )
+                if merge_result.returncode != 0:
+                    merge_errors.append({
+                        "vehicle_index": v["vehicle_index"],
+                        "branch": v["branch"],
+                        "error": merge_result.stderr[:500],
+                    })
+                    logger.warning(
+                        "Reconvergence: merge conflict for vehicle %d (branch %s) in container %s",
+                        v["vehicle_index"],
+                        v["branch"],
+                        container_id[:8],
+                    )
+                else:
+                    merged_paths.append(v["worktree_path"])
+                    logger.info(
+                        "Reconvergence: merged vehicle %d branch %s in container %s",
+                        v["vehicle_index"],
+                        v["branch"],
+                        container_id[:8],
+                    )
+
+            # If any merge conflicts: abort to NEEDS_DECISION and return early
+            if merge_errors:
+                conflict_detail = json.dumps(merge_errors)
+                self._store.set_status(container_id, ContainerStatus.NEEDS_DECISION)
+                parent_meta = self._meta.get(container_id) or {}
+                parent_meta["status"] = "failed"
+                parent_meta["result"] = f"Git merge conflicts during reconvergence: {conflict_detail}"
+                parent_meta["completed_at"] = datetime.now(timezone.utc).isoformat()
+                self._meta[container_id] = parent_meta
+                if self._broadcast_fn:
+                    try:
+                        self._broadcast_fn(container_id)
+                    except Exception as _be:
+                        logger.warning("Reconvergence: broadcast failed: %s", _be)
+                logger.warning(
+                    "Reconvergence: merge conflicts in container %s -- NEEDS_DECISION: %s",
+                    container_id[:8],
+                    conflict_detail,
+                )
+                print(
+                    f"RECONVERGE: merge conflicts -- NEEDS_DECISION set, parent task marked failed",
+                    flush=True,
+                )
+                return
+
+            # Clean up successfully merged worktrees
+            for wp in merged_paths:
+                try:
+                    subprocess.run(
+                        ["git", "worktree", "remove", wp],
+                        capture_output=True,
+                        cwd=repo_root,
+                    )
+                except Exception as e:
+                    logger.warning("Reconvergence: failed to remove worktree %s: %s", wp, e)
+
+            logger.info(
+                "Reconvergence: merged and cleaned %d worktree branches for container %s",
+                len(merged_paths),
+                container_id[:8],
+            )
+            print(
+                f"RECONVERGE: merged {len(merged_paths)} worktree branch(es) for container {container_id[:8]}",
+                flush=True,
+            )
+
         # Combine results for single brain persist
         combined = "\n\n---\n\n".join([
             f"## Vehicle {r['vehicle_index'] + 1}\n{(r['result'] or '')[:3000]}"
@@ -476,6 +620,13 @@ class Dispatcher:
         self._meta[container_id]["result"] = combined
         self._meta[container_id]["status"] = "completed"
         self._meta[container_id]["completed_at"] = datetime.now(timezone.utc).isoformat()
+
+        # Gap 1: Broadcast SSE so dashboard sees the parent task status change in real-time
+        if self._broadcast_fn:
+            try:
+                self._broadcast_fn(container_id)
+            except Exception as _be:
+                logger.warning("Reconvergence: broadcast failed: %s", _be)
 
         # Single PM notification
         try:
@@ -573,15 +724,11 @@ class Dispatcher:
             retry_count = self._store.increment_retry(container_id, vehicle_task_id)
 
             if retry_count <= 1:
-                # Silent auto-retry: re-enqueue the vehicle
+                # Silent auto-retry: re-activate the vehicle on its target machine
                 vid_meta = self._meta.get(vehicle_task_id) or {}
                 vid_spec = vid_meta.get("spec", "")
-                self._queue.enqueue(
-                    vehicle_task_id,
-                    vid_spec,
-                    priority="normal",
-                    target_machine="haze",
-                )
+                vid_target = vid_meta.get("target", "haze")
+                self._make_vehicle_runnable(vehicle_task_id, vid_spec, vid_target)
                 logger.info(
                     "Dispatcher: vehicle %s auto-retry (attempt %d) in container %s (reason: %s)",
                     vehicle_task_id,
@@ -600,7 +747,21 @@ class Dispatcher:
                     container_id,
                     reason,
                 )
-                # PM notification deferred to Phase 3c (agent_bus not imported yet)
+                # Gap 1: Promote parent task to failed so dashboard reflects reality
+                failure_detail = (
+                    f"Vehicle {vehicle_task_id[:8]} failed {retry_count} times "
+                    f"(reason: {reason or 'unknown'})"
+                )
+                parent_meta = self._meta.get(container_id) or {}
+                parent_meta["status"] = "failed"
+                parent_meta["result"] = failure_detail
+                parent_meta["completed_at"] = datetime.now(timezone.utc).isoformat()
+                self._meta[container_id] = parent_meta
+                if self._broadcast_fn:
+                    try:
+                        self._broadcast_fn(container_id)
+                    except Exception as _be:
+                        logger.warning("Dispatcher: broadcast failed: %s", _be)
 
     # ------------------------------------------------------------------
     # Vehicle blocked handler
@@ -630,4 +791,18 @@ class Dispatcher:
                 container_id,
                 reason,
             )
-            # PM notification deferred to Phase 3c (agent_bus not imported yet)
+            # Gap 1: Promote parent task to failed so dashboard reflects reality
+            block_detail = (
+                f"Vehicle {vehicle_task_id[:8]} BLOCKED "
+                f"(reason: {reason or 'unknown'})"
+            )
+            parent_meta = self._meta.get(container_id) or {}
+            parent_meta["status"] = "failed"
+            parent_meta["result"] = block_detail
+            parent_meta["completed_at"] = datetime.now(timezone.utc).isoformat()
+            self._meta[container_id] = parent_meta
+            if self._broadcast_fn:
+                try:
+                    self._broadcast_fn(container_id)
+                except Exception as _be:
+                    logger.warning("Dispatcher: broadcast failed: %s", _be)

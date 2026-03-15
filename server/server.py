@@ -31,7 +31,7 @@ from starlette.routing import Route
 
 from a2a.server.apps import A2AStarletteApplication
 from a2a.server.request_handlers import DefaultRequestHandler
-from a2a.server.tasks import InMemoryTaskStore
+# InMemoryTaskStore replaced by task_db.SQLiteTaskStore (persists across restarts)
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
 from a2a.types import (
@@ -46,7 +46,6 @@ from a2a.utils import new_agent_text_message
 import config
 import auth
 import persist_manager as pm
-import message_broker as broker  # legacy, kept for backward compat during migration
 import agent_bus
 import task_db
 from state_machine import TaskStateMachine, TaskState, IllegalTransitionError
@@ -59,17 +58,18 @@ from pm_autonomy import (
     get_confidence_map, should_auto_execute,
 )
 from task_queue import TaskQueue
-from bus_webhooks import WebhookRegistry
-from quality_scoring import score_post_outcome, quality_metrics as qm_metrics
+from agent_bus import WebhookRegistry
+from task_analytics import (
+    score_post_outcome, quality_metrics as qm_metrics,
+    validate_criteria, detect_hallucination, detect_drift,
+    make_verification_decision, ValidationResult,
+)
 from improvement_engine import (
     analyze_patterns, learn_thresholds, find_golden_templates,
     generate_suggestions, baseline_comparison, full_analysis,
 )
-from criteria_validator import (
-    validate_criteria, detect_hallucination, detect_drift,
-    make_verification_decision, ValidationResult,
-)
 from dispatcher import Dispatcher
+from container_store import ContainerStatus
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -86,7 +86,7 @@ logger = logging.getLogger("leroy-a2a")
 # ---------------------------------------------------------------------------
 # Task storage (A2A SDK store + persistent custom metadata)
 # ---------------------------------------------------------------------------
-_task_store = InMemoryTaskStore()
+_task_store = None  # set in main() after task_db.init() — uses SQLiteTaskStore
 _START_TIME = time.time()
 
 # Custom task metadata: task_id -> {spec, status, result, created_at, ...}
@@ -222,6 +222,12 @@ MAX_TASK_TIMEOUT = int(os.environ.get("LEROY_TASK_TIMEOUT", "3600"))  # 1 hour d
 LOGS_DIR = Path(WORK_DIR) / "logs"
 LOGS_DIR.mkdir(exist_ok=True)
 
+# Terminal statuses -- tasks in these states will never transition again
+_TERMINAL_STATUSES = frozenset({
+    "failed", "completed", "cancelled", "completed_unverified",
+    "completed_verified", "persisted", "archived", "escalated",
+})
+
 # Stuck task detection settings
 _STUCK_CHECK_INTERVAL = 60  # seconds between checks
 _STUCK_THRESHOLD = 120  # seconds after all subtasks done before flagging as stuck
@@ -232,6 +238,7 @@ _GRADUATED_GRACE_MINUTES = 5     # 0-5 min: no warnings
 _GRADUATED_WARN_MINUTES = 15     # 5-15 min: warn in metadata + SSE
 _GRADUATED_KILL_MINUTES = 30     # 15-30 min: kill with partial capture
 _PARTIAL_SNAPSHOT_INTERVAL = 60  # seconds between partial output snapshots
+_FIRST_OUTPUT_GATE_SECONDS = 180  # Kill if zero stdout after 3 minutes
 
 # System prompt injected into every claude -p invocation
 LEROY_SYSTEM_PROMPT = """You are Leroy, the Engineering Lead for the FORGE ecosystem.
@@ -313,9 +320,16 @@ _BUILDER_PROMPT_VERSION = hashlib.sha256(LEROY_SYSTEM_PROMPT.encode()).hexdigest
 
 
 def _setup_worktree(task_id: str) -> tuple[str | None, str | None]:
-    """Create a git worktree for builder isolation. Returns (worktree_path, branch_name) or (None, None)."""
+    """Create a git worktree for builder isolation. Returns (worktree_path, branch_name) or (None, None).
+
+    Worktrees are created OUTSIDE the main project directory to prevent Claude Code
+    from correlating builder sessions with Brad's active PM session. When worktrees
+    lived under .claude/worktrees/ inside the project, Claude treated them as the
+    same project context, causing ghost builds (zero stdout).
+    """
     branch_name = f"task/{task_id[:8]}"
-    worktree_path = os.path.join(WORK_DIR, ".claude", "worktrees", task_id)
+    worktree_base = os.environ.get("LEROY_WORKTREE_DIR", "/tmp/leroy-worktrees")
+    worktree_path = os.path.join(worktree_base, task_id)
     try:
         os.makedirs(os.path.dirname(worktree_path), exist_ok=True)
         subprocess.run(
@@ -435,18 +449,20 @@ def _run_claude_sync(task_id: str, spec: str) -> None:
             lf.write("\n")
             lf.flush()
 
+            # Change 2: Pass spec via stdin to avoid ARG_MAX limit (macOS: 131KB).
+            # Remove -p from argv; Claude CLI reads the prompt from stdin when no -p is given.
             proc = subprocess.Popen(
                 [
                     CLAUDE_BIN,
-                    "-p", spec,
-                    "--output-format", "text",
+                    "--output-format", "stream-json",
+                    "--verbose",
                     "--system-prompt", builder_system_prompt,
                     "--dangerously-skip-permissions",
                     "--no-session-persistence",
                     "--model", "sonnet",
                     "--setting-sources", "user",
                 ],
-                stdin=subprocess.DEVNULL,
+                stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -458,15 +474,39 @@ def _run_claude_sync(task_id: str, spec: str) -> None:
                 },
                 start_new_session=True,
             )
-            _active_pids[task_id] = proc.pid
-            logger.info("Task %s: claude PID %d (cwd=%s)", task_id, proc.pid, cwd)
+            # Write spec to stdin then close the pipe so Claude sees EOF and starts processing.
+            proc.stdin.write(spec)
+            proc.stdin.close()
 
-            stdout_lines = []
+            _active_pids[task_id] = proc.pid
+            logger.info("Task %s: claude PID %d (cwd=%s, spec_len=%d)", task_id, proc.pid, cwd, len(spec))
+
+            # Change 3: Early process health check -- detect instant crashes before the
+            # 180s first-output gate fires (bad arguments, missing entrypoint, etc.).
+            time.sleep(3)
+            if proc.poll() is not None:
+                rc = proc.returncode
+                try:
+                    early_stderr = proc.stderr.read()
+                except Exception:
+                    early_stderr = ""
+                logger.error(
+                    "Task %s: Claude exited immediately rc=%d stderr=%s",
+                    task_id, rc, early_stderr[:500],
+                )
+                raise subprocess.SubprocessError(
+                    f"Claude exited immediately rc={rc}: {early_stderr[:200]}"
+                )
+
+            stdout_lines = []       # raw JSON lines from stream-json
+            result_text_parts = []  # extracted text content for the final result
+            stream_result = None    # final result text from the "result" event
             stderr_lines = []
             last_snapshot_time = time.time()
             last_activity_time = time.time()
             task_start_time = time.time()
             warned_inactivity = False
+            first_output_received = False
             builder_sections: dict[str, str] = {}  # WHAT, REASONING, OUTPUT
 
             sel = selectors.DefaultSelector()
@@ -487,7 +527,7 @@ def _run_claude_sync(task_id: str, spec: str) -> None:
 
                 # v2 Phase 1: partial output snapshot every 60s
                 if now - last_snapshot_time >= _PARTIAL_SNAPSHOT_INTERVAL:
-                    partial = "".join(stdout_lines)
+                    partial = "".join(result_text_parts) if result_text_parts else "".join(stdout_lines)
                     if partial:
                         _task_meta[task_id]["partial_result"] = partial[-10000:]  # last 10k chars
                     last_snapshot_time = now
@@ -495,6 +535,14 @@ def _run_claude_sync(task_id: str, spec: str) -> None:
                 # v2 Phase 1: graduated inactivity timeout
                 inactivity = now - last_activity_time
                 elapsed_minutes = (now - task_start_time) / 60
+
+                # First-output gate: kill fast if builder never produces stdout
+                if not first_output_received and inactivity > _FIRST_OUTPUT_GATE_SECONDS:
+                    logger.warning(
+                        "Task %s: first-output gate triggered (%ds, zero stdout)",
+                        task_id, int(inactivity),
+                    )
+                    raise subprocess.TimeoutExpired(CLAUDE_BIN, int(inactivity))
 
                 if elapsed_minutes > _GRADUATED_GRACE_MINUTES:
                     if inactivity > kill_timeout:
@@ -553,16 +601,47 @@ def _run_claude_sync(task_id: str, spec: str) -> None:
                         lf.write(line)
                         lf.flush()
 
-                        # v2 Phase 1: parse heartbeat markers
-                        stripped = line.strip()
-                        if stripped.startswith("[PROGRESS]"):
-                            progress_msg = stripped[len("[PROGRESS]"):].strip()
+                        if not first_output_received:
+                            first_output_received = True
+                            logger.info("Task %s: first output received at %.1fs", task_id, time.time() - task_start_time)
+
+                        # Parse stream-json events for text extraction and heartbeats
+                        try:
+                            event = json.loads(line)
+                            event_type = event.get("type", "")
+
+                            if event_type == "assistant":
+                                # Extract text from assistant message content
+                                msg = event.get("message", {})
+                                for part in msg.get("content", []):
+                                    if part.get("type") == "text":
+                                        text_chunk = part.get("text", "")
+                                        if text_chunk:
+                                            result_text_parts.append(text_chunk)
+
+                            elif event_type == "result":
+                                # Final result -- extract the complete text
+                                stream_result = event.get("result", "")
+                                # Also capture cost and token info
+                                _task_meta[task_id]["stream_cost_usd"] = event.get("total_cost_usd")
+                                _task_meta[task_id]["stream_usage"] = event.get("usage")
+
+                        except (ValueError, KeyError):
+                            pass  # Not valid JSON or missing fields -- treat as raw text
+
+                        # v2 Phase 1: parse heartbeat markers from extracted text
+                        text_for_heartbeat = line.strip()
+                        # Also check result_text_parts for heartbeats (they may be in model output)
+                        if result_text_parts:
+                            text_for_heartbeat = result_text_parts[-1].strip()
+                        if text_for_heartbeat.startswith("[PROGRESS]"):
+                            progress_msg = text_for_heartbeat[len("[PROGRESS]"):].strip()
                             _task_meta[task_id]["last_progress"] = progress_msg
                             _task_meta[task_id]["last_progress_at"] = datetime.now(timezone.utc).isoformat()
                             logger.debug("Task %s: [PROGRESS] %s", task_id, progress_msg)
 
-                        elif stripped.startswith("[BLOCKED]"):
-                            block_msg = stripped[len("[BLOCKED]"):].strip()
+                        elif text_for_heartbeat.startswith("[BLOCKED]"):
+                            block_msg = text_for_heartbeat[len("[BLOCKED]"):].strip()
                             _task_meta[task_id]["blocked_reason"] = block_msg
                             logger.warning("Task %s: [BLOCKED] %s", task_id, block_msg)
                             if _state_machine:
@@ -577,12 +656,12 @@ def _run_claude_sync(task_id: str, spec: str) -> None:
                                 except (IllegalTransitionError, KeyError) as e:
                                     logger.warning("v2 BLOCKED transition failed: %s", e)
 
-                        elif stripped.startswith("[WHAT]"):
-                            builder_sections["what"] = stripped[len("[WHAT]"):].strip()
-                        elif stripped.startswith("[REASONING]"):
-                            builder_sections["reasoning"] = stripped[len("[REASONING]"):].strip()
-                        elif stripped.startswith("[OUTPUT]"):
-                            builder_sections["output"] = stripped[len("[OUTPUT]"):].strip()
+                        elif text_for_heartbeat.startswith("[WHAT]"):
+                            builder_sections["what"] = text_for_heartbeat[len("[WHAT]"):].strip()
+                        elif text_for_heartbeat.startswith("[REASONING]"):
+                            builder_sections["reasoning"] = text_for_heartbeat[len("[REASONING]"):].strip()
+                        elif text_for_heartbeat.startswith("[OUTPUT]"):
+                            builder_sections["output"] = text_for_heartbeat[len("[OUTPUT]"):].strip()
                     else:
                         stderr_lines.append(line)
                         lf.write(f"[STDERR] {line}")
@@ -639,7 +718,9 @@ def _run_claude_sync(task_id: str, spec: str) -> None:
                 except (ProcessLookupError, OSError):
                     pass
 
-            stdout = "".join(stdout_lines)
+            # stream-json: extract final result text (prefer stream_result from
+            # the "result" event, fall back to assembled text parts, then raw lines)
+            stdout = stream_result or "".join(result_text_parts) or "".join(stdout_lines)
             stderr = "".join(stderr_lines)
 
             lf.write(f"\n=== Process exited with code {proc.returncode} at {datetime.now(timezone.utc).isoformat()} ===\n")
@@ -726,9 +807,12 @@ def _run_claude_sync(task_id: str, spec: str) -> None:
 
     except subprocess.TimeoutExpired:
         _active_pids.pop(task_id, None)
-        # v2 Phase 1: collect partial output before killing
-        partial_output = "".join(stdout_lines) if 'stdout_lines' in dir() else ""
+        # v2 Phase 1: collect partial output before killing (stream-json: prefer extracted text)
+        partial_output = ("".join(result_text_parts) if 'result_text_parts' in dir() and result_text_parts
+                          else "".join(stdout_lines) if 'stdout_lines' in dir() else "")
         _task_meta[task_id]["partial_result"] = partial_output[-10000:] if partial_output else ""
+        # Change 1: capture stderr so ghost builds (zero stdout) show WHY Claude crashed
+        stderr_captured = "".join(stderr_lines) if 'stderr_lines' in dir() else ""
 
         if proc:
             # v2 Phase 1: explicit FD cleanup before kill
@@ -747,6 +831,9 @@ def _run_claude_sync(task_id: str, spec: str) -> None:
                     pass
 
         timeout_result = partial_output if partial_output else f"Task timed out after {kill_timeout}s (no output)"
+        # Change 1: append stderr to timeout result so ghost build crash reason is visible
+        if stderr_captured:
+            timeout_result += f"\n\n[STDERR]\n{stderr_captured}"
         if _state_machine and _retry_budget:
             try:
                 categories = classify_failure(timeout_result, {**(_task_meta.get(task_id) or {}), "timeout": True})
@@ -886,9 +973,22 @@ class LeroyExecutor(AgentExecutor):
                     _target = _t
                 break
 
+        # Store target in task metadata for filtering (e.g. kush_worker polls ?target=kush)
+        _task_meta[task_id]["target"] = _target
+
+        # Check for ## Atomic: true header (dispatcher must not slice atomic specs)
+        _is_atomic = False
+        for _line in (spec_text or "").split("\n")[:20]:
+            if _line.strip().lower().startswith("## atomic:"):
+                _is_atomic = _line.split(":", 1)[1].strip().lower() in ("true", "yes", "1")
+                break
+
         # Dispatcher Phase 3a: check if spec needs slicing into vehicles
+        # Skip dispatcher for atomic specs only. All targets (haze, kush, halo, studio)
+        # get full dispatcher treatment. The dispatcher routes vehicles to the correct
+        # machine via target-aware _make_vehicle_runnable().
         _dispatched = False
-        if _dispatcher is not None:
+        if _dispatcher is not None and not _is_atomic:
             try:
                 from spec_analyzer import extract_typed_ir
                 _typed_ir = extract_typed_ir(spec_text)
@@ -902,7 +1002,8 @@ class LeroyExecutor(AgentExecutor):
                     )
                     if _cid:
                         logger.info(
-                            "Task %s dispatched as container %s with vehicles", task_id, _cid
+                            "Task %s dispatched as container %s with vehicles (target=%s)",
+                            task_id, _cid, _target,
                         )
                         _task_meta[task_id]["status"] = "dispatched"
                         _dispatched = True
@@ -911,9 +1012,17 @@ class LeroyExecutor(AgentExecutor):
                     "Dispatcher intercept failed for task %s (fail-open to normal enqueue): %s",
                     task_id, _de,
                 )
+        elif _is_atomic:
+            logger.info("Task %s marked ## Atomic: true -- skipping dispatcher", task_id)
 
+        # Enqueue non-dispatched tasks.
+        # Local machines (haze): push into the in-process TaskQueue.
+        # Remote machines (kush, halo, studio): leave as 'pending' for remote workers to poll.
         if not _dispatched:
-            _task_queue.enqueue(task_id, spec_text, priority="normal", target_machine=_target)
+            if _target in ("haze",):
+                _task_queue.enqueue(task_id, spec_text, priority="normal", target_machine=_target)
+            else:
+                logger.info("Task %s left pending for remote worker pickup (target=%s)", task_id, _target)
 
         _broadcast_task_update_sync(task_id)
 
@@ -1180,7 +1289,12 @@ def _compute_pipeline_stage(task: dict) -> dict:
     elif status in ("qa_review", "completed_unverified"):
         stage = "qa"
     elif status == "completed":
-        if not retro_text and not pass_rate:
+        # Vehicle tasks (dispatcher sub-tasks with a parent_id) are sub-units of a parent spec.
+        # They don't have their own spec files and can't be retro'd independently.
+        # The parent's retro covers the full work -- skip retro/persist for vehicles.
+        if task.get("parent_id"):
+            stage = "done"
+        elif not retro_text and not pass_rate:
             stage = "retro"
         elif not brain_persisted:
             stage = "persist"
@@ -1209,11 +1323,14 @@ async def tasks_list(request: Request) -> JSONResponse:
         return JSONResponse({"error": "authorization required"}, status_code=401)
 
     status_filter = request.query_params.get("status")
+    target_filter = request.query_params.get("target")  # e.g. ?target=kush
     # Default: hide archived tasks. Pass ?include_archived=true to see them.
     include_archived = request.query_params.get("include_archived", "").lower() in ("1", "true", "yes")
     tasks = list(_task_meta.values())
     if status_filter:
         tasks = [t for t in tasks if t["status"] == status_filter]
+    if target_filter:
+        tasks = [t for t in tasks if t.get("target") == target_filter]
     if not include_archived:
         tasks = [t for t in tasks if not t.get("archived", False)]
 
@@ -1264,6 +1381,136 @@ async def task_cancel(request: Request) -> JSONResponse:
     _task_meta[task_id]["status"] = "cancelled"
     logger.info("Task %s cancelled via REST", task_id)
     return JSONResponse({"status": "ok", "task_id": task_id})
+
+
+async def task_force_fail(request: Request) -> JSONResponse:
+    """POST /tasks/{task_id}/force-fail -- Force-fail a stuck task regardless of current state.
+
+    Body: {"reason": "optional explanation"}  (reason defaults to "force_failed_by_operator")
+
+    Behavior:
+    - Accepts any task status (dispatched, working, pending, etc.)
+    - Sets status to "failed" and v2_state to "escalated" (terminal)
+    - Sends SIGTERM to the process group if the task has an active PID
+    - Marks all non-terminal vehicle tasks (parent_id == task_id) as failed
+    - Broadcasts SSE update and sends agent bus notification
+    """
+    client = _check_auth(request)
+    if client is None:
+        return JSONResponse({"error": "authorization required"}, status_code=401)
+
+    task_id = request.path_params["task_id"]
+    if task_id not in _task_meta:
+        return JSONResponse({"error": f"task {task_id} not found"}, status_code=404)
+
+    # Parse optional reason from body
+    reason = "force_failed_by_operator"
+    try:
+        body = await request.json()
+        if body.get("reason"):
+            reason = str(body["reason"])
+    except Exception:
+        pass  # No body or invalid JSON -- use default reason
+
+    meta = _task_meta[task_id]
+    previous_status = meta.get("status", "unknown")
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    # --- Kill active process if any ---
+    pid = _active_pids.get(task_id)
+    kill_note = ""
+    if pid:
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+            kill_note = f" (sent SIGTERM to PID {pid})"
+            logger.info("Task %s force-fail: sent SIGTERM to process group (PID %d)", task_id, pid)
+        except (ProcessLookupError, OSError) as kill_err:
+            kill_note = f" (SIGTERM skipped: {kill_err})"
+            logger.info("Task %s force-fail: SIGTERM skipped (%s)", task_id, kill_err)
+        _active_pids.pop(task_id, None)
+
+    # --- Force task to failed state (bypass state machine validation) ---
+    meta["status"] = "failed"
+    meta["completed_at"] = now_iso
+    meta["force_failed_at"] = now_iso
+    meta["force_fail_reason"] = reason
+    meta["result"] = f"[Force-failed by operator: {reason}]{kill_note}"
+
+    # Directly write terminal v2_state (bypasses transition validation intentionally)
+    meta["v2_state"] = TaskState.ESCALATED.value
+    history = meta.get("v2_state_history", [])
+    history.append({
+        "state": TaskState.ESCALATED.value,
+        "timestamp": now_iso,
+        "reason": f"force_fail: {reason}",
+        "from_state": meta.get("v2_state", "unknown"),
+    })
+    meta["v2_state_history"] = history
+
+    # --- Fail all non-terminal vehicle tasks (containers with parent_id == task_id) ---
+    vehicle_ids = [
+        vid for vid, vm in _task_meta.items()
+        if vm.get("parent_id") == task_id
+    ]
+    failed_vehicles = []
+    for vid in vehicle_ids:
+        v_meta = _task_meta[vid]
+        v_status = v_meta.get("status", "unknown")
+        if v_status not in _TERMINAL_STATUSES:
+            # Kill vehicle process if active
+            v_pid = _active_pids.get(vid)
+            if v_pid:
+                try:
+                    os.killpg(os.getpgid(v_pid), signal.SIGTERM)
+                    logger.info("Task %s force-fail: sent SIGTERM to vehicle %s PID %d", task_id, vid, v_pid)
+                except (ProcessLookupError, OSError):
+                    pass
+                _active_pids.pop(vid, None)
+            v_meta["status"] = "failed"
+            v_meta["completed_at"] = now_iso
+            v_meta["result"] = f"[Parent container {task_id} force-failed: {reason}]"
+            v_meta["v2_state"] = TaskState.ESCALATED.value
+            v_hist = v_meta.get("v2_state_history", [])
+            v_hist.append({
+                "state": TaskState.ESCALATED.value,
+                "timestamp": now_iso,
+                "reason": f"parent_force_fail: {reason}",
+            })
+            v_meta["v2_state_history"] = v_hist
+            _broadcast_task_update_sync(vid)
+            failed_vehicles.append(vid)
+
+    # --- Broadcast SSE update for container task ---
+    _broadcast_task_update_sync(task_id)
+
+    # --- Agent bus notification ---
+    agent_bus.send({
+        "from": "leroy",
+        "to": "pm",
+        "type": "status_update",
+        "task_id": task_id,
+        "content": f"Task {task_id} force-failed by operator: {reason}",
+        "context": (
+            f"Previous status: {previous_status}. "
+            f"Vehicles failed: {len(failed_vehicles)} ({', '.join(failed_vehicles) if failed_vehicles else 'none'})."
+            f"{kill_note}"
+        ),
+        "requires_response": False,
+    })
+
+    logger.info(
+        "Task %s force-failed by %s: reason=%r previous_status=%s vehicles_failed=%d",
+        task_id, client.get("client_id"), reason, previous_status, len(failed_vehicles),
+    )
+
+    return JSONResponse({
+        "task_id": task_id,
+        "previous_status": previous_status,
+        "new_status": "failed",
+        "reason": reason,
+        "vehicles_failed": failed_vehicles,
+        "pid_killed": pid,
+    })
 
 
 async def task_archive(request: Request) -> JSONResponse:
@@ -1416,7 +1663,7 @@ async def task_delete(request: Request) -> JSONResponse:
 async def pm_messages_receive(request: Request) -> JSONResponse:
     """POST /pm/messages -- Leroy subprocess sends a message to PM.
 
-    Body: full message schema (see message_broker.py docstring).
+    Body: full message schema (see agent_bus.py docstring).
     Returns: {"message_id": "...", "status": "queued"}
     """
     # No auth check here -- subprocess runs on same machine, no token available.
@@ -1988,7 +2235,15 @@ def _stuck_task_detector() -> None:
                 # no subtasks, and no activity for a long time. This catches tasks
                 # that lost their PID on server restart or where the builder crashed
                 # before producing any output.
+                #
+                # SKIP for remote-target tasks: they execute on another machine
+                # (kush, halo, studio, etc.) and will never have a local PID.
+                # Status comes back via POST /tasks/{id}/result from the worker.
                 _ORPHAN_THRESHOLD = 600  # 10 minutes with no activity and no PID
+                _task_target = meta.get("target", "haze")
+                if _task_target not in ("haze",):
+                    continue  # Remote task -- worker manages lifecycle
+
                 last_activity = meta.get("last_activity", meta.get("created_at", ""))
                 if last_activity and not subtasks:
                     try:
@@ -2030,12 +2285,242 @@ def _stuck_task_detector() -> None:
                             logger.info("ORPHAN TASK %s: auto-failed successfully", task_id)
                     except (ValueError, TypeError) as parse_err:
                         logger.debug("Orphan check skipped for %s: %s", task_id, parse_err)
+
+            # --- Dispatched task recovery ---
+            # Tasks in "dispatched" status have been handed to the dispatcher which
+            # creates vehicle sub-tasks.  If the builder was unavailable when vehicles
+            # were enqueued, nothing retries them and the container sits in "dispatched"
+            # forever.  This block detects and recovers those stalls.
+            _DISPATCH_STALL_THRESHOLD = 300  # 5 minutes
+
+            for task_id, meta in list(_task_meta.items()):
+                if meta.get("status") != "dispatched":
+                    continue
+
+                # Parse created_at to determine age
+                created_raw = meta.get("created_at") or meta.get("created", "")
+                if not created_raw:
+                    continue
+                try:
+                    created_time = datetime.fromisoformat(created_raw)
+                    now_dt = datetime.now(timezone.utc)
+                    age_seconds = (now_dt - created_time).total_seconds()
+                except (ValueError, TypeError) as _parse_err:
+                    logger.debug("Dispatched recovery: skipping %s, bad timestamp: %s", task_id, _parse_err)
+                    continue
+
+                if age_seconds < _DISPATCH_STALL_THRESHOLD:
+                    continue  # Too young, not stalled yet
+
+                # Find vehicle tasks whose parent_id == this container task
+                vehicle_ids = [
+                    vid for vid, vm in _task_meta.items()
+                    if vm.get("parent_id") == task_id
+                ]
+
+                if not vehicle_ids:
+                    # Dispatcher returned a container_id but never created vehicles
+                    logger.warning(
+                        "DISPATCH STALL: task %s has been dispatched for %.0fs with no vehicles. "
+                        "Falling back to direct enqueue.",
+                        task_id, age_seconds,
+                    )
+                    spec_text = meta.get("spec", "")
+                    _task_meta[task_id]["status"] = "pending"
+                    _recover_target = meta.get("target", "haze")
+                    if _recover_target in ("haze",) and _task_queue:
+                        _task_queue.enqueue(task_id, spec_text, priority="normal", target_machine=_recover_target)
+                    else:
+                        logger.info("Recovery: task %s left pending for remote worker (target=%s)", task_id, _recover_target)
+                    _broadcast_task_update_sync(task_id)
+                    continue
+
+                # Check if any vehicle is actively running (working = in progress)
+                any_working = any(
+                    _task_meta.get(vid, {}).get("status") == "working"
+                    for vid in vehicle_ids
+                )
+                if any_working:
+                    continue  # Container has a vehicle actively running -- leave it alone
+
+                # Check for blocked vehicles whose deps are all satisfied.
+                # This catches the case where a vehicle completed but the unblock
+                # handler didn't fire (e.g. server restarted between completion and unblock).
+                any_blocked = any(
+                    _task_meta.get(vid, {}).get("status") == "blocked"
+                    for vid in vehicle_ids
+                )
+                if any_blocked and _dispatcher:
+                    # Re-trigger the dispatcher's completion handler for each done vehicle.
+                    # This is idempotent -- it only unblocks vehicles whose deps are satisfied.
+                    done_vehicles = [
+                        vid for vid in vehicle_ids
+                        if _task_meta.get(vid, {}).get("status") in ("completed", "completed_unverified")
+                        or _task_meta.get(vid, {}).get("v2_state", "") in _dispatcher._DONE_STATES
+                    ]
+                    if done_vehicles:
+                        logger.warning(
+                            "DISPATCH STALL: task %s has %d blocked vehicles with %d done -- "
+                            "re-triggering unblock",
+                            task_id, sum(1 for v in vehicle_ids if _task_meta.get(v,{}).get("status")=="blocked"),
+                            len(done_vehicles),
+                        )
+                        for vid in done_vehicles:
+                            try:
+                                _dispatcher.handle_vehicle_completed(vid)
+                            except Exception as _hvc_err:
+                                logger.warning("Recovery: handle_vehicle_completed(%s) failed: %s", vid[:8], _hvc_err)
+                        _broadcast_task_update_sync(task_id)
+                        continue  # Let the unblock take effect; next sweep will check again
+
+                # No vehicle is active.  Re-enqueue vehicles that are still pending/dispatched.
+                ready_vehicles = [
+                    vid for vid in vehicle_ids
+                    if _task_meta.get(vid, {}).get("status") in ("pending", "dispatched")
+                ]
+                if ready_vehicles:
+                    logger.warning(
+                        "DISPATCH STALL: task %s stalled for %.0fs -- %d/%d vehicles idle. "
+                        "Re-enqueuing %d vehicle(s).",
+                        task_id, age_seconds, len(ready_vehicles), len(vehicle_ids), len(ready_vehicles),
+                    )
+                    for vid in ready_vehicles:
+                        v_meta = _task_meta.get(vid, {})
+                        v_spec = v_meta.get("spec", "")
+                        v_target = v_meta.get("target", meta.get("target", "haze"))
+                        if v_target in ("haze",) and _task_queue:
+                            _task_queue.enqueue(vid, v_spec, priority="normal", target_machine=v_target)
+                        else:
+                            # Remote: ensure status is pending for worker polling
+                            _task_meta[vid]["status"] = "pending"
+                            logger.info("Recovery: vehicle %s set pending for remote worker (target=%s)", vid[:8], v_target)
+                    _broadcast_task_update_sync(task_id)
+                else:
+                    # All vehicles failed/cancelled and none are recoverable
+                    logger.error(
+                        "DISPATCH STALL: task %s has been dispatched for %.0fs and has no recoverable vehicles "
+                        "(%d total, none pending/dispatched/working). Marking failed.",
+                        task_id, age_seconds, len(vehicle_ids),
+                    )
+                    now_iso = datetime.now(timezone.utc).isoformat()
+                    tracked = _task_meta[task_id]
+                    tracked["status"] = "failed"
+                    tracked["completed_at"] = now_iso
+                    tracked["result"] = (
+                        f"[Auto-failed by dispatch recovery: task dispatched {int(age_seconds)}s ago with "
+                        f"{len(vehicle_ids)} vehicle(s), none recoverable. "
+                        f"Check logs/{task_id}.log]"
+                    )
+                    _broadcast_task_update_sync(task_id)
+                    agent_bus.send({
+                        "from": "leroy", "to": "pm",
+                        "type": "deliverable_ready",
+                        "task_id": task_id,
+                        "content": (
+                            f"Task {task_id} FAILED -- dispatch stall with no recoverable vehicles after "
+                            f"{int(age_seconds)}s. Check logs/{task_id}.log"
+                        ),
+                        "requires_response": False,
+                    })
+
         except Exception:
             logger.exception("Stuck task detector error")
 
 
+def _parse_target_from_task(task_id: str) -> str:
+    """Return 'kush' or 'haze' for a task.
+
+    Priority:
+    1. typed_ir JSON field from plan_store (plan.typed_ir -> parse -> .target)
+    2. Spec text search for '## target: kush'
+    Defaults to 'haze'.
+    """
+    try:
+        store = task_db.plan_store
+        if store:
+            plan = store.get_plan_by_task(task_id)
+            if plan:
+                tir_raw = plan.get("typed_ir")
+                if tir_raw and isinstance(tir_raw, str):
+                    try:
+                        tir = json.loads(tir_raw)
+                        tgt = (tir.get("target") or "").lower()
+                        if tgt in ("kush", "haze"):
+                            return tgt
+                    except Exception:
+                        pass
+                # typed_ir may also be stored as dict directly
+                elif tir_raw and isinstance(tir_raw, dict):
+                    tgt = (tir_raw.get("target") or "").lower()
+                    if tgt in ("kush", "haze"):
+                        return tgt
+    except Exception:
+        pass
+
+    # Fallback: scan spec text
+    spec = (_task_meta.get(task_id) or {}).get("spec", "") or ""
+    for line in spec.split("\n")[:20]:
+        if line.strip().lower().startswith("## target:"):
+            t = line.split(":", 1)[1].strip().lower()
+            if t in ("kush", "haze"):
+                return t
+    return "haze"
+
+
+def _compute_elapsed_seconds(task_id: str) -> float | None:
+    """Compute elapsed_seconds for a task.
+
+    Non-terminal: now - created_at.
+    Terminal: completed_at - created_at.
+    Returns None if timestamps are missing/invalid.
+    """
+    meta = _task_meta.get(task_id) or {}
+    created_raw = meta.get("created_at", "")
+    if not created_raw:
+        return None
+    try:
+        created = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+    status = meta.get("status", "")
+    if status in _TERMINAL_STATUSES:
+        completed_raw = meta.get("completed_at", "")
+        if completed_raw:
+            try:
+                completed = datetime.fromisoformat(completed_raw.replace("Z", "+00:00"))
+                return round((completed - created).total_seconds(), 1)
+            except Exception:
+                pass
+        # Terminal but no completed_at -- use now
+        return round((datetime.now(timezone.utc) - created).total_seconds(), 1)
+    else:
+        return round((datetime.now(timezone.utc) - created).total_seconds(), 1)
+
+
+async def _get_cpu_percent(pid: int) -> float | None:
+    """Return CPU% for a PID using asyncio subprocess (non-blocking).
+
+    Uses 'ps -p <pid> -o %cpu=' on macOS/Linux.
+    Returns None on any error or if PID not found.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ps", "-p", str(pid), "-o", "%cpu=",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3.0)
+        output = stdout.decode().strip()
+        if output:
+            return float(output)
+    except Exception:
+        pass
+    return None
+
+
 async def task_logs(request: Request) -> JSONResponse:
-    """GET /tasks/{task_id}/logs -- Tail the task log file for Ops troubleshooting."""
+    """GET /tasks/{task_id}/logs -- Tail the task log file with enhanced observability fields."""
     client = _check_auth(request)
     if client is None:
         return JSONResponse({"error": "authorization required"}, status_code=401)
@@ -2044,8 +2529,41 @@ async def task_logs(request: Request) -> JSONResponse:
     tail_lines = int(request.query_params.get("tail", "50"))
     log_file = LOGS_DIR / f"{task_id}.log"
 
+    # --- Collect vehicle/container info ---
+    vehicle_ids = [
+        vid for vid, vm in (_task_meta or {}).items()
+        if vm.get("parent_id") == task_id
+    ]
+    is_container = len(vehicle_ids) > 0 and not log_file.exists()
+
+    # --- Task status and metadata ---
+    meta = (_task_meta or {}).get(task_id, {})
+    status = meta.get("status", "unknown")
+    elapsed_seconds = _compute_elapsed_seconds(task_id)
+
+    # --- Target and remote log hint ---
+    target = _parse_target_from_task(task_id)
+    remote_log_hint = None
+    if target == "kush":
+        remote_log_hint = f"Log is on kush.local at ~/Projects/ops-agent/logs/{task_id}.log"
+
     if not log_file.exists():
-        return JSONResponse({"error": "no log file for this task", "task_id": task_id}, status_code=404)
+        base_response = {
+            "task_id": task_id,
+            "status": status,
+            "elapsed_seconds": elapsed_seconds,
+            "target": target,
+            "remote_log_hint": remote_log_hint,
+            "is_container": is_container,
+            "vehicle_ids": vehicle_ids if vehicle_ids else None,
+            "last_activity": meta.get("last_activity"),
+            "stuck_detected": meta.get("_stuck_detected_at"),
+        }
+        if is_container:
+            base_response["error"] = "container task has no log file; see vehicle_ids"
+            return JSONResponse(base_response, status_code=200)
+        base_response["error"] = "no log file for this task"
+        return JSONResponse(base_response, status_code=404)
 
     try:
         lines = log_file.read_text().splitlines()
@@ -2059,18 +2577,189 @@ async def task_logs(request: Request) -> JSONResponse:
             except ProcessLookupError:
                 pass
 
+        # CPU percent via async subprocess (only if process is alive)
+        cpu_percent = None
+        if pid and pid_alive:
+            cpu_percent = await _get_cpu_percent(pid)
+
         return JSONResponse({
             "task_id": task_id,
+            "status": status,
+            "elapsed_seconds": elapsed_seconds,
+            "cpu_percent": cpu_percent,
+            "target": target,
+            "remote_log_hint": remote_log_hint,
+            "is_container": is_container,
+            "vehicle_ids": vehicle_ids if vehicle_ids else None,
             "log_lines": tail,
             "total_lines": len(lines),
             "showing": len(tail),
             "log_file": str(log_file),
             "process": {"pid": pid, "alive": pid_alive} if pid else None,
-            "last_activity": _task_meta.get(task_id, {}).get("last_activity"),
-            "stuck_detected": _task_meta.get(task_id, {}).get("_stuck_detected_at"),
+            "last_activity": meta.get("last_activity"),
+            "stuck_detected": meta.get("_stuck_detected_at"),
         })
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def task_logs_stream(request: Request):
+    """GET /tasks/{task_id}/logs/stream -- SSE stream of live log lines.
+
+    Events:
+    - snapshot: initial last N lines (one event per line)
+    - line: new log line appended to file
+    - heartbeat: every 10s with status/elapsed
+    - waiting: no log file yet (pre-execution); every 2s
+    - closed: task deleted or stream terminating
+    - error: container task or other error (JSON body)
+    """
+    client = _check_auth(request)
+    if client is None:
+        return JSONResponse({"error": "authorization required"}, status_code=401)
+
+    task_id = request.path_params["task_id"]
+    snapshot_lines = int(request.query_params.get("snapshot", "20"))
+    log_file = LOGS_DIR / f"{task_id}.log"
+
+    # --- Pre-check: task existence ---
+    if (_task_meta or {}).get(task_id) is None:
+        return JSONResponse({"error": f"task {task_id} not found"}, status_code=404)
+
+    # --- Pre-check: container task ---
+    vehicle_ids = [
+        vid for vid, vm in (_task_meta or {}).items()
+        if vm.get("parent_id") == task_id
+    ]
+    if vehicle_ids and not log_file.exists():
+        return JSONResponse({
+            "error": "container task has no log stream; tail vehicle tasks instead",
+            "task_id": task_id,
+            "vehicle_ids": vehicle_ids,
+        }, status_code=409)
+
+    async def _sse_generator():
+        _NO_GROWTH_STALL_SECONDS = 300  # 5 minutes of no growth + dead PID = close
+        _HEARTBEAT_INTERVAL = 10.0
+        _WAITING_INTERVAL = 2.0
+        _POLL_INTERVAL = 0.25  # how often to check for new lines
+        _SNAPSHOT_SENT = False
+
+        last_line_count = 0
+        last_growth_time = time.monotonic()
+        last_heartbeat_time = time.monotonic()
+
+        def _sse_event(event: str, data: str) -> str:
+            return f"event: {event}\ndata: {data}\n\n"
+
+        def _heartbeat_data() -> str:
+            meta = (_task_meta or {}).get(task_id) or {}
+            return json.dumps({
+                "task_id": task_id,
+                "status": meta.get("status", "unknown"),
+                "elapsed_seconds": _compute_elapsed_seconds(task_id),
+            })
+
+        try:
+            while True:
+                # --- Check task still exists ---
+                if (_task_meta or {}).get(task_id) is None:
+                    yield _sse_event("closed", json.dumps({"reason": "task deleted", "task_id": task_id}))
+                    return
+
+                meta = (_task_meta or {}).get(task_id) or {}
+                status = meta.get("status", "unknown")
+                now = time.monotonic()
+
+                # --- No log file yet: waiting phase ---
+                if not log_file.exists():
+                    if status in _TERMINAL_STATUSES:
+                        yield _sse_event("closed", json.dumps({
+                            "reason": "task terminal with no log file",
+                            "status": status,
+                        }))
+                        return
+
+                    yield _sse_event("waiting", json.dumps({
+                        "task_id": task_id,
+                        "status": status,
+                        "message": "waiting for log file to appear",
+                    }))
+                    await asyncio.sleep(_WAITING_INTERVAL)
+                    continue
+
+                # --- Log file exists: read lines ---
+                try:
+                    all_lines = log_file.read_text().splitlines()
+                except Exception as e:
+                    yield _sse_event("error", json.dumps({"error": str(e)}))
+                    await asyncio.sleep(1.0)
+                    continue
+
+                current_count = len(all_lines)
+
+                # --- Snapshot: send last N lines on first read ---
+                if not _SNAPSHOT_SENT:
+                    snap = all_lines[-snapshot_lines:] if len(all_lines) > snapshot_lines else all_lines
+                    for line in snap:
+                        yield _sse_event("snapshot", json.dumps({"line": line}))
+                    _SNAPSHOT_SENT = True
+                    last_line_count = current_count
+                    last_growth_time = now
+                elif current_count > last_line_count:
+                    # New lines appeared
+                    new_lines = all_lines[last_line_count:]
+                    for line in new_lines:
+                        yield _sse_event("line", json.dumps({"line": line}))
+                    last_line_count = current_count
+                    last_growth_time = now
+
+                # --- Heartbeat (time-based, every 10s) ---
+                if now - last_heartbeat_time >= _HEARTBEAT_INTERVAL:
+                    yield _sse_event("heartbeat", _heartbeat_data())
+                    last_heartbeat_time = now
+
+                # --- Terminal status: close stream ---
+                if status in _TERMINAL_STATUSES:
+                    yield _sse_event("closed", json.dumps({
+                        "reason": "task reached terminal status",
+                        "status": status,
+                        "task_id": task_id,
+                    }))
+                    return
+
+                # --- Stall detection: no growth + dead PID for 5min ---
+                pid = _active_pids.get(task_id)
+                pid_alive = False
+                if pid:
+                    try:
+                        os.kill(pid, 0)
+                        pid_alive = True
+                    except ProcessLookupError:
+                        pass
+
+                if not pid_alive and (now - last_growth_time) >= _NO_GROWTH_STALL_SECONDS:
+                    yield _sse_event("closed", json.dumps({
+                        "reason": "no log growth and process dead for 5 minutes",
+                        "task_id": task_id,
+                    }))
+                    return
+
+                await asyncio.sleep(_POLL_INTERVAL)
+
+        except asyncio.CancelledError:
+            # Client disconnected
+            return
+
+    return StreamingResponse(
+        _sse_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3705,10 +4394,12 @@ def build_app():
         Route("/tasks/stream", tasks_stream, methods=["GET"]),
         Route("/tasks/{task_id}/accept", task_accept, methods=["POST"]),
         Route("/tasks/{task_id}/cancel", task_cancel, methods=["POST"]),
+        Route("/tasks/{task_id}/force-fail", task_force_fail, methods=["POST"]),
         Route("/tasks/{task_id}/archive", task_archive, methods=["POST"]),
         Route("/tasks/{task_id}/unarchive", task_unarchive, methods=["POST"]),
         Route("/tasks/{task_id}/review", task_review, methods=["POST"]),
         Route("/tasks/{task_id}", task_delete, methods=["DELETE"]),
+        Route("/tasks/{task_id}/logs/stream", task_logs_stream, methods=["GET"]),
         Route("/tasks/{task_id}/logs", task_logs, methods=["GET"]),
         Route("/tasks/{task_id}/subtasks", subtask_list, methods=["GET"]),
         Route("/tasks/{task_id}/subtasks", subtask_update, methods=["POST"]),
@@ -3822,7 +4513,8 @@ def main():
     task_db.init(config.TASK_DB_PATH)
     _task_meta = task_db.task_meta
     _subtask_store = task_db.subtask_store
-    broker.init_store(task_db.msg_store)
+    global _task_store
+    _task_store = task_db.sqlite_task_store
     agent_bus.init(task_db.msg_store, task_db.agent_store)
     _agent_store = task_db.agent_store
     _activity_store = task_db.activity_store
@@ -3836,18 +4528,6 @@ def main():
     _action_store = PMActionStore(task_db._db)
     logger.info("v2 state machine, retry budget, and PM action store initialized")
 
-    # Dispatcher Phase 1: Container recovery sweep (IC-9)
-    # Detects stale vehicles from previous runs and logs container state.
-    # Routing/reconvergence actions are deferred to Phase 3.
-    if task_db.container_store is not None:
-        try:
-            task_db.container_store.recovery_sweep_containers(
-                task_meta_getter=_task_meta.get,
-                state_machine_ref=_state_machine,
-            )
-        except Exception as _e:
-            logger.warning("Dispatcher recovery sweep failed (non-fatal): %s", _e)
-
     # v2 Phase 8A: Concurrency-controlled task queue
     _task_queue = TaskQueue(execute_fn=_execute_task, concurrency=None)
 
@@ -3858,10 +4538,29 @@ def main():
             task_queue=_task_queue,
             task_meta=_task_meta,
             state_machine=_state_machine,
+            broadcast_fn=_broadcast_task_update_sync,
         )
         logger.info("Dispatcher Phase 3a initialized (routing + dependency gating)")
     else:
         logger.warning("Dispatcher Phase 3a: container_store not available -- dispatcher disabled")
+
+    # Dispatcher recovery sweep (IC-9, IC-13): runs after dispatcher is ready so
+    # reconvergence callbacks can be wired in.  Failure callback marks the container
+    # NEEDS_DECISION directly on the store (vehicle-level retries are handled by the
+    # normal handle_vehicle_failed path on next dispatch cycle).
+    if task_db.container_store is not None:
+        try:
+            def _recovery_failure_cb(cid: str) -> None:
+                task_db.container_store.set_status(cid, ContainerStatus.NEEDS_DECISION)
+
+            task_db.container_store.recovery_sweep_containers(
+                task_meta_getter=_task_meta.get,
+                state_machine_ref=_state_machine,
+                reconverge_callback=_dispatcher.reconverge,
+                failure_callback=_recovery_failure_cb,
+            )
+        except Exception as _e:
+            logger.warning("Dispatcher recovery sweep failed (non-fatal): %s", _e)
 
     # v2 Phase 8B: Webhook registry for bus push delivery
     _webhook_registry = WebhookRegistry(db=task_db._db)

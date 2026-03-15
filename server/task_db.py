@@ -1013,6 +1013,97 @@ class PlanStore:
 
 
 # ---------------------------------------------------------------------------
+# SQLiteTaskStore -- A2A SDK TaskStore adapter backed by our SQLite tasks table
+# ---------------------------------------------------------------------------
+
+class SQLiteTaskStore:
+    """Implements the A2A SDK TaskStore interface using our SQLite tasks table.
+
+    A2A Task objects are serialized as JSON and stored under the '_a2a' key
+    in the existing tasks table, colocated with our custom task metadata.
+    Cold-start recovery: A2A task objects survive server restarts.
+
+    Replaces a2a.server.tasks.InMemoryTaskStore — no separate in-memory store.
+    """
+
+    def __init__(self, db: "TaskDB"):
+        self._db = db
+        self._lock = None  # set lazily (needs asyncio loop)
+
+    def _get_lock(self):
+        import asyncio
+        if self._lock is None:
+            try:
+                self._lock = asyncio.Lock()
+            except RuntimeError:
+                pass  # no event loop yet, will be created on first await
+        return self._lock
+
+    async def save(self, task, context=None) -> None:  # task: a2a.types.Task
+        """Save or update an A2A task object. Colocates with our task metadata."""
+        task_id = task.id
+        now = datetime.now(timezone.utc).isoformat()
+        task_json = task.model_dump_json() if hasattr(task, "model_dump_json") else str(task)
+
+        # Merge A2A data into existing task row (preserves our metadata)
+        with self._db._write_lock:
+            row = self._db._conn.execute(
+                "SELECT data FROM tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+
+            if row:
+                existing = json.loads(row["data"])
+                existing["_a2a"] = json.loads(task_json) if isinstance(task_json, str) else task_json
+                data = json.dumps(existing)
+            else:
+                # New row — A2A-only (no custom metadata yet)
+                data = json.dumps({"task_id": task_id, "_a2a": json.loads(task_json)})
+
+            self._db._conn.execute(
+                "INSERT OR REPLACE INTO tasks (task_id, data, updated_at) VALUES (?, ?, ?)",
+                (task_id, data, now),
+            )
+            self._db._conn.commit()
+
+    async def get(self, task_id: str, context=None):  # -> a2a.types.Task | None
+        """Retrieve an A2A task object from SQLite."""
+        row = self._db._conn.execute(
+            "SELECT data FROM tasks WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        if not row:
+            return None
+
+        data = json.loads(row["data"])
+        a2a_data = data.get("_a2a")
+        if not a2a_data:
+            return None
+
+        # Lazy import to avoid circular dependency at module load time
+        try:
+            from a2a.types import Task
+            return Task.model_validate(a2a_data)
+        except Exception:
+            return None
+
+    async def delete(self, task_id: str, context=None) -> None:
+        """Remove only the A2A data from a task row (preserve our metadata)."""
+        row = self._db._conn.execute(
+            "SELECT data FROM tasks WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        if not row:
+            return
+        data = json.loads(row["data"])
+        data.pop("_a2a", None)
+        now = datetime.now(timezone.utc).isoformat()
+        with self._db._write_lock:
+            self._db._conn.execute(
+                "INSERT OR REPLACE INTO tasks (task_id, data, updated_at) VALUES (?, ?, ?)",
+                (task_id, json.dumps(data), now),
+            )
+            self._db._conn.commit()
+
+
+# ---------------------------------------------------------------------------
 # Module-level singletons -- init() must be called before use
 # ---------------------------------------------------------------------------
 _db: TaskDB | None = None
@@ -1024,11 +1115,13 @@ activity_store: ActivityStore | None = None
 proposal_store: ProposalStore | None = None
 plan_store: PlanStore | None = None
 container_store: "ContainerStore | None" = None
+sqlite_task_store: SQLiteTaskStore | None = None
 
 
 def init(db_path: Path | None = None) -> None:
     """Initialize the module-level singletons. Call once at server startup."""
-    global _db, task_meta, subtask_store, msg_store, agent_store, activity_store, proposal_store, plan_store, container_store
+    global _db, task_meta, subtask_store, msg_store, agent_store, activity_store
+    global proposal_store, plan_store, container_store, sqlite_task_store
     from container_store import ContainerStore
     path = db_path or DB_PATH
     _db = TaskDB(path)
@@ -1040,4 +1133,5 @@ def init(db_path: Path | None = None) -> None:
     proposal_store = ProposalStore(_db)
     plan_store = PlanStore(_db)
     container_store = ContainerStore(db_path=path)
+    sqlite_task_store = SQLiteTaskStore(_db)
     logger.info("task_db initialized (path=%s)", path)
